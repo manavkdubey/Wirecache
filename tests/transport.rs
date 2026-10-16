@@ -227,6 +227,73 @@ async fn local_routes_and_rejected_requests_do_not_reach_origin() {
 }
 
 #[tokio::test]
+async fn overload_is_immediate_and_completed_work_releases_capacity() {
+    let mut origin = Origin::start(true).await;
+    let mut proxy = RunningProxy::start(origin.address, &["--max-upstream-requests", "1"]).await;
+    let address = proxy.address;
+    let first = tokio::spawn(async move {
+        exchange(
+            address,
+            "GET /first HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    });
+    origin.next().await;
+    let response = exchange(
+        address,
+        "GET /second HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 503"));
+    assert!(response.contains("retry-after: 1"));
+    origin.release.add_permits(1);
+    assert!(first.await.unwrap().starts_with("HTTP/1.1 201"));
+    assert!(
+        exchange(
+            address,
+            "GET /third HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
+        )
+        .await
+        .starts_with("HTTP/1.1 201")
+    );
+    assert_eq!(origin.next().await.uri().path(), "/third");
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn upstream_header_timeout_returns_504_and_recovers() {
+    let mut origin = Origin::start(true).await;
+    let mut proxy = RunningProxy::start(
+        origin.address,
+        &[
+            "--upstream-timeout-ms",
+            "100",
+            "--max-upstream-requests",
+            "1",
+        ],
+    )
+    .await;
+    let address = proxy.address;
+    let first = tokio::spawn(async move {
+        exchange(
+            address,
+            "GET /slow HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    });
+    origin.next().await;
+    assert!(first.await.unwrap().starts_with("HTTP/1.1 504"));
+    origin.release.add_permits(2);
+    let response = exchange(
+        address,
+        "GET /recovered HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 201"));
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn connection_failure_returns_502() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
