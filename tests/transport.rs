@@ -182,6 +182,65 @@ async fn absolute_form_cannot_change_origin_and_get_is_forwarded() {
     proxy.shutdown().await;
 }
 
+#[tokio::test]
+async fn local_routes_and_rejected_requests_do_not_reach_origin() {
+    let mut origin = Origin::start(false).await;
+    let mut proxy = RunningProxy::start(origin.address, &["--max-request-body-bytes", "4"]).await;
+    for (request, status) in [
+        (
+            "GET /healthz HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+            200,
+        ),
+        (
+            "GET /metrics HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+            200,
+        ),
+        (
+            "POST /healthz HTTP/1.1\r\nHost: local\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            405,
+        ),
+        (
+            "CONNECT evil.example:80 HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+            501,
+        ),
+        (
+            "GET / HTTP/1.1\r\nHost: local\r\nConnection: close, upgrade\r\nUpgrade: websocket\r\n\r\n",
+            501,
+        ),
+        (
+            "GET / HTTP/1.1\r\nHost: local\r\nConnection: close, content-length\r\n\r\n",
+            400,
+        ),
+        (
+            "POST / HTTP/1.1\r\nHost: local\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello",
+            413,
+        ),
+    ] {
+        let response = exchange(proxy.address, request).await;
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{response}"
+        );
+    }
+    assert!(origin.requests.try_recv().is_err());
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn connection_failure_returns_502() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut proxy = RunningProxy::start(address, &[]).await;
+    let response = exchange(
+        proxy.address,
+        "GET / HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 502"));
+    proxy.shutdown().await;
+}
+
 #[test]
 fn rejects_invalid_origin_and_limits() {
     for origin in [
