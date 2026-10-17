@@ -330,3 +330,136 @@ fn rejects_invalid_origin_and_limits() {
     assert!(Proxy::new(config).is_err());
 }
 
+#[tokio::test]
+async fn response_streams_before_completion_and_holds_upstream_capacity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut proxy = RunningProxy::start(
+        listener.local_addr().unwrap(),
+        &["--max-upstream-requests", "1"],
+    )
+    .await;
+    let (release, released) = oneshot::channel();
+    let origin = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        receive_headers(&mut stream).await;
+        stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-End\r\n\r\n5\r\nfirst\r\n").await.unwrap();
+        released.await.unwrap();
+        stream
+            .write_all(b"6\r\nsecond\r\n0\r\nX-End: omitted\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let stream = TcpStream::connect(proxy.address).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    let response = sender
+        .send_request(
+            Request::builder()
+                .uri("/stream")
+                .header("host", "local")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!response.headers().contains_key("trailer"));
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first, "first");
+    let overloaded = exchange(
+        proxy.address,
+        "GET /other HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(overloaded.starts_with("HTTP/1.1 503"));
+    release.send(()).unwrap();
+    let mut rest = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.unwrap();
+        assert!(!frame.is_trailers());
+        rest.extend_from_slice(frame.data_ref().unwrap());
+    }
+    assert_eq!(rest, b"second");
+    origin.await.unwrap();
+    drop(sender);
+    connection.await.unwrap().unwrap();
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn stalled_response_body_terminates_with_an_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut proxy = RunningProxy::start(
+        listener.local_addr().unwrap(),
+        &["--upstream-timeout-ms", "200"],
+    )
+    .await;
+    let (release, released) = oneshot::channel::<()>();
+    let origin = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        receive_headers(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nprefix")
+            .await
+            .unwrap();
+        let _ = released.await;
+    });
+    let stream = TcpStream::connect(proxy.address).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    let response = sender
+        .send_request(
+            Request::builder()
+                .uri("/stalled")
+                .header("host", "local")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), response.into_body().collect())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    drop(release);
+    origin.await.unwrap();
+    drop(sender);
+    let _ = connection.await.unwrap();
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_drains_a_pending_request() {
+    let mut origin = Origin::start(true).await;
+    let mut proxy = RunningProxy::start(origin.address, &[]).await;
+    let address = proxy.address;
+    let request = tokio::spawn(async move {
+        exchange(
+            address,
+            "GET /pending HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+        )
+        .await
+    });
+    origin.next().await;
+    proxy.stop.take().unwrap().send(()).unwrap();
+    origin.release.add_permits(1);
+    assert!(request.await.unwrap().starts_with("HTTP/1.1 201"));
+    tokio::time::timeout(Duration::from_secs(2), &mut proxy.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
