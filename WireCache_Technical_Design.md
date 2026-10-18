@@ -77,18 +77,19 @@ Use `cargo add` to resolve current compatible versions; do not assume legacy Hyp
 - GET; no body; no Authorization, Cookie, Range, If-* headers, no Cache-Control bypass directives; no Pragma: no-cache; no upgrade.
 - Valid target and only fixed origin; normalized key includes method, upstream identity, path and query. Preserve percent-encoding and query order unless normalization is proven safe (default: use unchanged path/query).
 - No request header that the origin could use to choose personalized representation **unless a local allowlist policy guarantees the endpoint is public and invariant across request headers**. Recommended P0: configure `--cache-path-prefix /public/` and strip/standardize response-varying request headers as appropriate. This is critical: `Vary` is only known after origin responds, so coalescing *before* inspecting it needs an assumption of equivalent requests. For strict correctness across arbitrary clients, single-flight only if headers are canonicalized to a fixed safe profile for an explicitly public route; otherwise bypass coalescing.
+- Accepted profile: Host, Connection close/keep-alive, optional zero Content-Length, Accept `*/*`, and Accept-Encoding `identity` only. Standardize candidate Host/Accept/Accept-Encoding and omit explicit Content-Length. All extra headers and encoded/dot-segment paths bypass. See [ADR-002](docs/adr/ADR-002-cache-policy.md).
 
 **Response is cacheable only if:**
 - 200 OK; no `Set-Cookie`; `Cache-Control: public, max-age=N` or `s-maxage=N` with valid positive N; no `private`, `no-store`, `no-cache`, `must-understand`, malformed/conflicting directives, or Vary. (P0 deliberately rejects `Vary` entirely.)
-- No `Content-Range` or 206; no unexpected `Content-Encoding` mismatch; no pre-existing `Age` or `Date` if their correct freshness handling is not implemented; body is successfully read and size ≤ max entry.
+- No `Content-Range` or 206, `Content-Encoding`, or announced/unannounced trailers; Date/Age must parse unambiguously; body is successfully read and size ≤ max entry.
 - The request is inside a public endpoint allowlist, and request headers forwarded to the origin are a fixed/allowlisted representation-affecting set. **Do not cache personalized or user-dependent responses.**
-- Since we do not implement Age/Date/validators completely in P0, do not claim RFC 9111 compliance. Prefer to calculate Age if returning real HTTP cache semantics; otherwise demo upstream uses simplified explicit freshness and no Age/Date headers, with an explicit limitation.
+- P0 implements explicit Date/Age freshness and updates Age on cached responses. Validators, variants, and broader HTTP cache semantics remain unsupported; do not claim full RFC 9111 compliance.
 
 Important nuance: `Cache-Control: public` does not by itself imply safe treatment of every request context. The conservative local public-route allowlist and auth/cookie rejection are intentional defense in depth. Do not cache if header parsing is ambiguous.
 
-**Freshness:** `expires_at = Instant::now() + clamped_ttl` after full successful response. Prefer minimum of `s-maxage` then `max-age`, capped by configured TTL. If no explicit freshness -> bypass. A stale entry is discarded, never served in P0.
+**Freshness:** `initial_age = max(apparent_date_age, Age + response_delay)`. Use `s-maxage` when present; otherwise require `public, max-age`. Remaining freshness is lifetime minus initial age, capped by configured local retention. Expiry starts at header receipt, so buffering consumes freshness. Monotonic residence increases outgoing Age. If no valid explicit freshness -> bypass. Never serve stale entries.
 
-**Mutation:** P0 bypasses non-GET methods. For successful unsafe methods, invalidate the same target key, if present; do not claim complete HTTP invalidation semantics. If shared cache is deployed in front of a mutable origin, the P0 safe default is to cache **immutable/public demonstration routes only**.
+**Mutation:** P0 bypasses non-GET methods. Conservatively invalidate the same target at unsafe-attempt admission and completion, even on failure/cancellation. Version tokens fence older fills, with tracking retained only for bounded active work. Do not claim complete HTTP invalidation semantics. See [ADR-006](docs/adr/ADR-006-cache-storage.md). Cache immutable/public demonstration routes by default.
 
 ## 6. Data models (pseudocode; NOT copy/paste-ready Rust)
 ```rust
@@ -134,7 +135,7 @@ A terminal outcome is immutable and retained long enough for subscribers to obse
 **Race test:** barriers arrange 100 concurrent arrivals before upstream completes. Assert `origin_counter == 1`, every result correct. Additional barrier tests exercise leader cancellation and table cleanup while a replacement request arrives.
 
 ## 8. Body & memory strategy
-For eligible cache paths, use full buffering **only up to** `max_entry_bytes`; ensure no unbounded `collect()` even when response lacks Content-Length. If limit is exceeded mid-stream, it is not safe to announce a shared success. One viable P0 policy: spool to bounded memory then return 502 for the original leader when over limit (document restrictive limit) **but a better product behavior** is to deliver original uncached content by streaming while followers retry privately. Streaming fallback requires careful ownership of the partially consumed body and is a P1 complexity tradeoff. Select a consistent P0 behavior explicitly in ADR-003 before writing code; do not silently truncate responses. For bypass traffic, stream bodies, including large bodies, with backpressure. Do not buffer every bypass.
+For eligible cache paths, buffer **only up to** `max_entry_bytes`; never use unbounded `collect()` when response length is unknown. Accepted P0 behavior: on overflow, privately replay the buffered prefix and crossing chunk, then stream the remainder with backpressure. Do not cache or announce a shared success; eventual followers retry independently under admission limits. Bypass traffic streams directly. See [ADR-003](docs/adr/ADR-003-body-buffering.md).
 
 Memory upper bound should be explainable: cache cap + (max concurrent eligible flights × max per-entry buffering) + bounded metadata/waiter overhead + upstream transport buffers. Bound global number of waiters, not just per-key, if necessary.
 

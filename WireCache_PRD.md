@@ -37,12 +37,12 @@ When a popular resource expires, numerous clients can simultaneously miss cache 
 - Cache key: normalized scheme + configured upstream authority + path + query + GET method; never key on untrusted Host. Because all `Vary` responses are bypassed in P0, no variable-header variants are cached.
 - Buffer eligible candidate bodies up to configurable maximum (default 1 MiB), with timeout and early content-length rejection. A body that exceeds max or fails during transfer must never be cached or shared as a completed response. For this portfolio MVP, large/unknown/bypassed bodies may be fully buffered only under a separate strictly bounded pass-through policy **or preferably streamed**; see technical design.
 - Per-key single-flight coordination only for requests meeting conservative request eligibility. One independent leader task owned by a coordinator, not by the first request handler; followers subscribe with deadlines.
-- Cache TTL based on monotonic `Instant` at insertion and parsed freshness. Do not serve expired entries. Simplified HTTP `Age` semantics: cached response eligibility excludes pre-existing Age/Date where freshness calculations cannot be performed correctly; the preferred production-like extension is explicit age calculation. See technical design.
+- Calculate explicit freshness using Date, Age, and origin response delay; use monotonic `Instant` for body buffering and residence. Never restart the full TTL at insertion or serve expired entries. Invalid or duplicate Date/Age bypass. See [ADR-002](docs/adr/ADR-002-cache-policy.md).
 - Deterministic tests: concurrent miss, leader disconnect, upstream timeout, upstream error, cancellation, cache expiry, no-store, private, authorization, cookies, `Vary`, GET query isolation, oversized response, shutdown, and repeated failed fetch.
 - Bounded admission: max concurrent upstream flights, max waiters per key, max distinct flights, cache byte cap, entry cap, timeouts; overload returns 503 with Retry-After or defined fail-open behavior.
 
 ### P1 — after MVP
-- RFC-aware Age/Date freshness, conditional requests with validators (ETag/If-None-Match, 304), additional `Vary` variants (e.g. Accept-Encoding) with canonicalized variant matching, safe invalidation on unsafe methods, streaming follower responses if feasible, graceful drain, CLI config validation.
+- Conditional requests with validators (ETag/If-None-Match, 304), additional `Vary` variants (e.g. Accept-Encoding) with canonicalized variant matching, broader invalidation beyond the P0 same-target policy, streaming follower responses if feasible, graceful drain, CLI config validation.
 
 ### P2 — intentionally not a requirement
 - HTTPS termination, HTTP/2/3, CONNECT/WebSockets, arbitrary origin selection, multi-node coordination, disk persistence, CDN functionality, full RFC 9111 conformance, public internet exposure, distributed cache consistency.
