@@ -11,51 +11,10 @@ use tokio::{
     sync::{Semaphore, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
 };
-use wirecache::{Config, Proxy, serve};
+use wirecache::{Config, Proxy};
 
-struct RunningProxy {
-    address: SocketAddr,
-    stop: Option<oneshot::Sender<()>>,
-    task: JoinHandle<std::io::Result<()>>,
-}
-
-impl RunningProxy {
-    async fn start(origin: SocketAddr, options: &[&str]) -> Self {
-        let mut args = vec![
-            "wirecache".to_owned(),
-            "--upstream".to_owned(),
-            format!("http://{origin}"),
-        ];
-        args.extend(options.iter().map(|value| (*value).to_owned()));
-        let config = Config::try_parse_from(args).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(serve(listener, Proxy::new(config).unwrap(), async {
-            let _ = stopped.await;
-        }));
-        Self {
-            address,
-            stop: Some(stop),
-            task,
-        }
-    }
-
-    async fn shutdown(&mut self) {
-        self.stop.take().unwrap().send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(7), &mut self.task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-}
-
-impl Drop for RunningProxy {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
+mod support;
+use support::RunningProxy;
 
 struct Origin {
     address: SocketAddr,
@@ -328,6 +287,26 @@ fn rejects_invalid_origin_and_limits() {
     ])
     .unwrap();
     assert!(Proxy::new(config).is_err());
+    for (option, value) in [
+        ("--cache-path-prefix", "public/"),
+        ("--cache-path-prefix", "/public"),
+        ("--cache-path-prefix", "/public/../"),
+        ("--cache-path-prefix", "/public/%2f/"),
+        ("--max-cache-mib", "0"),
+        ("--max-entry-kib", "65537"),
+        ("--max-cache-entries", "0"),
+        ("--max-ttl-secs", "0"),
+    ] {
+        let config = Config::try_parse_from([
+            "wirecache",
+            "--upstream",
+            "http://localhost:9000",
+            option,
+            value,
+        ])
+        .unwrap();
+        assert!(Proxy::new(config).is_err(), "{option} {value}");
+    }
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@ edition = "2024"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 http-body-util = "0.1.5"
+httpdate = "1.0.3"
 hyper = { version = "1.12.0", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }

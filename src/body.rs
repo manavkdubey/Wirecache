@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     error::Error,
     future::Future,
     io,
@@ -21,6 +22,58 @@ pub(crate) fn full(value: impl Into<Bytes>) -> ProxyBody {
     Full::new(value.into())
         .map_err(|never| match never {})
         .boxed_unsync()
+}
+
+pub(crate) struct PrefixBody {
+    prefix: VecDeque<Bytes>,
+    tail: StreamBody,
+}
+
+impl PrefixBody {
+    pub(crate) fn new(prefix: Bytes, overflow: Bytes, tail: StreamBody) -> Self {
+        Self {
+            prefix: [prefix, overflow]
+                .into_iter()
+                .filter(|chunk| !chunk.is_empty())
+                .collect(),
+            tail,
+        }
+    }
+}
+
+impl Body for PrefixBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        if let Some(chunk) = this.prefix.pop_front() {
+            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+        }
+        Pin::new(&mut this.tail).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.is_empty() && self.tail.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let prefix = self
+            .prefix
+            .iter()
+            .map(|chunk| chunk.len() as u64)
+            .sum::<u64>();
+        let tail = self.tail.size_hint();
+        let mut hint = SizeHint::new();
+        hint.set_lower(prefix.saturating_add(tail.lower()));
+        if let Some(upper) = tail.upper().and_then(|upper| upper.checked_add(prefix)) {
+            hint.set_upper(upper);
+        }
+        hint
+    }
 }
 
 pub(crate) struct StreamBody {

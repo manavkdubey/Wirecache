@@ -604,6 +604,7 @@ dependencies = [
  "bytes",
  "clap",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "tokio",

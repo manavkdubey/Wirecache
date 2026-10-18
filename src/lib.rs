@@ -1,6 +1,8 @@
 mod body;
+mod cache;
 mod config;
 mod headers;
+mod policy;
 mod proxy;
 mod server;
 
