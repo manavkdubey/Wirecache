@@ -296,6 +296,10 @@ fn rejects_invalid_origin_and_limits() {
         ("--max-entry-kib", "65537"),
         ("--max-cache-entries", "0"),
         ("--max-ttl-secs", "0"),
+        ("--max-flights", "0"),
+        ("--max-waiters", "0"),
+        ("--max-waiters-per-key", "0"),
+        ("--waiter-timeout-ms", "0"),
     ] {
         let config = Config::try_parse_from([
             "wirecache",

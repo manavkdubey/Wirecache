@@ -53,6 +53,7 @@ pub async fn serve(
         }
     };
     stop.send_replace(true);
+    proxy.shutdown().await;
     if tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(result) = connections.join_next().await {
             if let Err(error) = result {

@@ -26,6 +26,9 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn is_fresh(&self, now: Instant) -> bool {
+        self.freshness.expires_at() > now
+    }
     pub(crate) fn new(
         mut headers: HeaderMap,
         body: Bytes,
@@ -181,6 +184,15 @@ impl Cache {
         }
     }
 
+    pub(crate) fn version_matches(&self, key: &CacheKey, version: &Arc<()>) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .targets
+            .get(key)
+            .is_some_and(|target| target.mutations == 0 && Arc::ptr_eq(version, &target.version))
+    }
+
     pub(crate) fn begin_mutation(self: &Arc<Self>, key: CacheKey) -> Mutation {
         let mut state = self.state.lock().unwrap();
         state.remove(&key);
@@ -205,6 +217,14 @@ pub(crate) struct Fill {
 }
 
 impl Fill {
+    pub(crate) fn version(&self) -> Arc<()> {
+        self.version.clone()
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.cache.version_matches(&self.key, &self.version)
+    }
+
     pub(crate) fn insert(&self, snapshot: Arc<Snapshot>, now: Instant) -> bool {
         if snapshot.body.len() > self.cache.max_entry_bytes
             || snapshot.freshness.expires_at() <= now

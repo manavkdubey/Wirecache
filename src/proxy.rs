@@ -5,37 +5,32 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use http_body_util::BodyExt;
 use hyper::{
     Request, Response, StatusCode, Uri, Version,
     body::{Body, Incoming},
-    header::{ACCEPT, ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, RETRY_AFTER, UPGRADE},
+    header::{ACCEPT, ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, UPGRADE},
 };
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::{TokioExecutor, TokioTimer},
-};
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
-    time::{Instant, timeout_at},
-};
+use tokio::time::{Instant, timeout_at};
 
 use crate::{
     Config,
-    body::{PrefixBody, ProxyBody, StreamBody, full},
-    cache::{Cache, CacheKey, Fill, Snapshot},
+    body::{ProxyBody, StreamBody, full},
+    cache::{Cache, CacheKey},
+    error::{FetchError, reply},
+    flight::{Admission, Coordinator, Outcome},
     headers, policy,
+    upstream::{FetchResult, Upstream},
 };
 
 pub struct Proxy {
     pub(crate) config: Config,
-    client: Client<HttpConnector, ProxyBody>,
-    upstream_slots: Arc<Semaphore>,
+    upstream: Arc<Upstream>,
+    flights: Arc<Coordinator>,
     requests: AtomicU64,
-    origin_requests: AtomicU64,
     overloads: AtomicU64,
     cache: Arc<Cache>,
 }
@@ -43,28 +38,23 @@ pub struct Proxy {
 impl Proxy {
     pub fn new(config: Config) -> io::Result<Arc<Self>> {
         config.validate()?;
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(Duration::from_millis(config.upstream_timeout_ms)));
-        let client = Client::builder(TokioExecutor::new())
-            .pool_timer(TokioTimer::new())
-            .pool_idle_timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(config.max_upstream_requests)
-            .http1_max_buf_size(32 * 1024)
-            .retry_canceled_requests(false)
-            .build(connector);
+        let cache = Cache::new(
+            config.max_cache_mib * 1024 * 1024,
+            config.max_cache_entries,
+            config.max_entry_kib * 1024,
+        );
         Ok(Arc::new(Self {
-            cache: Cache::new(
-                config.max_cache_mib * 1024 * 1024,
-                config.max_cache_entries,
-                config.max_entry_kib * 1024,
-            ),
-            upstream_slots: Arc::new(Semaphore::new(config.max_upstream_requests)),
+            upstream: Upstream::new(&config),
+            flights: Coordinator::new(cache.clone(), &config),
             config,
-            client,
+            cache,
             requests: AtomicU64::new(0),
-            origin_requests: AtomicU64::new(0),
             overloads: AtomicU64::new(0),
         }))
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.flights.shutdown().await;
     }
 
     pub(crate) async fn handle(
@@ -101,13 +91,18 @@ impl Proxy {
             let metrics = format!(
                 "wirecache_requests_total {}\nwirecache_origin_requests_total {}\nwirecache_overloads_total {}\n",
                 self.requests.load(Ordering::Relaxed),
-                self.origin_requests.load(Ordering::Relaxed),
+                self.upstream.attempts(),
                 self.overloads.load(Ordering::Relaxed)
             );
             let stats = self.cache.stats();
             let metrics = format!(
                 "{metrics}wirecache_cache_bytes {}\nwirecache_cache_entries {}\nwirecache_cache_hits_total {}\nwirecache_cache_misses_total {}\nwirecache_cache_evictions_total {}\n",
                 stats.bytes, stats.entries, stats.hits, stats.misses, stats.evictions
+            );
+            let flights = self.flights.stats();
+            let metrics = format!(
+                "{metrics}wirecache_flights_created_total {}\nwirecache_singleflight_join_total {}\nwirecache_unshared_total {}\nwirecache_inflight_flights {}\nwirecache_waiters {}\n",
+                flights.created, flights.joined, flights.unshared, flights.active, flights.waiters
             );
             let mut response = reply(StatusCode::OK, metrics);
             response.headers_mut().insert(
@@ -143,9 +138,6 @@ impl Proxy {
             self.config.cache_path_prefix.as_deref(),
         );
         let key = CacheKey(uri.to_string());
-        if candidate && let Some(snapshot) = self.cache.get(&key, Instant::now()) {
-            return Ok(snapshot.response(Instant::now()));
-        }
         if request.headers().get(CONTENT_LENGTH).is_some_and(|length| {
             length
                 .to_str()
@@ -175,29 +167,21 @@ impl Proxy {
                 .parse()
                 .unwrap(),
         );
-        let Ok(permit) = self.upstream_slots.clone().try_acquire_owned() else {
-            self.overloads.fetch_add(1, Ordering::Relaxed);
-            let mut response = reply(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "upstream capacity exhausted\n",
-            );
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, "1".parse().unwrap());
-            return Ok(response);
-        };
-        let _mutation = (self.config.cache_path_prefix.is_some() && !request.method().is_safe())
-            .then(|| self.cache.begin_mutation(key.clone()));
-        let fill = candidate.then(|| self.cache.begin_fill(key));
         if candidate {
             request.headers_mut().remove(CONTENT_LENGTH);
             request.headers_mut().insert(ACCEPT, "*/*".parse().unwrap());
             request
                 .headers_mut()
                 .insert(ACCEPT_ENCODING, "identity".parse().unwrap());
+            let template = Template {
+                uri: request.uri().clone(),
+                headers: request.headers().clone(),
+            };
+            return Ok(self.candidate(key, template).await);
         }
-        let requested_at = Instant::now();
-        let deadline = requested_at + Duration::from_millis(self.config.upstream_timeout_ms);
+        let _mutation = (self.config.cache_path_prefix.is_some() && !request.method().is_safe())
+            .then(|| self.cache.begin_mutation(key));
+        let deadline = self.upstream_deadline();
         let request = request.map(|body| {
             StreamBody::new(
                 body,
@@ -207,114 +191,89 @@ impl Proxy {
             )
             .boxed_unsync()
         });
-        self.origin_requests.fetch_add(1, Ordering::Relaxed);
-        let response = match timeout_at(deadline, self.client.request(request)).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => return Ok(reply(StatusCode::BAD_GATEWAY, "upstream request failed\n")),
-            Err(_) => return Ok(reply(StatusCode::GATEWAY_TIMEOUT, "upstream timed out\n")),
-        };
-        Ok(self
-            .forward_response(response, fill, requested_at, deadline, permit)
-            .await)
+        Ok(self.private_result(self.upstream.fetch(request, None, deadline).await))
     }
 
-    async fn forward_response(
-        &self,
-        response: Response<Incoming>,
-        fill: Option<Fill>,
-        requested_at: Instant,
-        deadline: Instant,
-        permit: OwnedSemaphorePermit,
-    ) -> Response<ProxyBody> {
-        let received_at = Instant::now();
-        let response_time = SystemTime::now();
-        let freshness = fill.as_ref().and_then(|_| {
-            policy::response_freshness(
-                response.status(),
-                response.headers(),
-                requested_at,
-                received_at,
-                response_time,
-                Duration::from_secs(self.config.max_ttl_secs),
-            )
-        });
-        let (mut parts, mut body) = response.into_parts();
-        if parts.status == StatusCode::SWITCHING_PROTOCOLS
-            || headers::sanitize(&mut parts.headers).is_err()
-        {
-            return reply(StatusCode::BAD_GATEWAY, "unsupported upstream response\n");
+    fn upstream_deadline(&self) -> Instant {
+        Instant::now() + Duration::from_millis(self.config.upstream_timeout_ms)
+    }
+
+    fn failed(&self, error: FetchError) -> Response<ProxyBody> {
+        if error == FetchError::Overloaded {
+            self.overloads.fetch_add(1, Ordering::Relaxed);
         }
-        let limit = self.config.max_entry_kib * 1024;
-        let oversized = parts.headers.get(CONTENT_LENGTH).is_some_and(|value| {
-            value
-                .to_str()
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .is_none_or(|size| size > limit)
-        });
-        let Some(freshness) =
-            freshness.filter(|_| !oversized && parts.headers.contains_key("cache-control"))
-        else {
-            return Response::from_parts(
-                parts,
-                StreamBody::new(body, deadline, None, Some(permit)).boxed_unsync(),
-            );
-        };
-        let mut buffered = Vec::new();
-        let mut trailers = false;
-        loop {
-            let frame = match timeout_at(deadline, body.frame()).await {
-                Ok(Some(Ok(frame))) => frame,
-                Ok(Some(Err(_))) => {
-                    return reply(StatusCode::BAD_GATEWAY, "upstream body failed\n");
-                }
-                Err(_) => return reply(StatusCode::GATEWAY_TIMEOUT, "upstream body timed out\n"),
-                Ok(None) => break,
-            };
-            let Ok(chunk) = frame.into_data() else {
-                trailers = true;
-                continue;
-            };
-            if chunk.len() > limit - buffered.len() {
-                let prefix = bytes::Bytes::from(buffered.into_boxed_slice());
-                let tail = StreamBody::new(body, deadline, None, Some(permit));
-                return Response::from_parts(
-                    parts,
-                    PrefixBody::new(prefix, chunk, tail).boxed_unsync(),
+        error.response()
+    }
+
+    fn private_result(&self, result: FetchResult) -> Response<ProxyBody> {
+        match result {
+            FetchResult::Shared(snapshot) => snapshot.response(Instant::now()),
+            FetchResult::Private(response) => response,
+            FetchResult::Failed(error) => self.failed(error),
+        }
+    }
+
+    async fn candidate(&self, key: CacheKey, template: Template) -> Response<ProxyBody> {
+        let deadline = Instant::now() + Duration::from_millis(self.config.waiter_timeout_ms);
+        let mut ticket = match self.flights.admit(key) {
+            Ok(Admission::Hit(snapshot)) => return snapshot.response(Instant::now()),
+            Ok(Admission::Bypass) => {
+                return self.private_result(
+                    self.upstream
+                        .fetch(template.request(), None, self.upstream_deadline())
+                        .await,
                 );
             }
-            let needed = buffered.len() + chunk.len();
-            if needed > buffered.capacity() {
-                let capacity = needed
-                    .checked_next_power_of_two()
-                    .unwrap_or(limit)
-                    .min(limit);
-                buffered.reserve_exact(capacity - buffered.len());
+            Ok(Admission::Wait(ticket)) => ticket,
+            Ok(Admission::Start(ticket, work)) => {
+                self.flights.spawn(
+                    work,
+                    self.upstream.clone(),
+                    template.request(),
+                    self.upstream_deadline(),
+                );
+                ticket
             }
-            buffered.extend_from_slice(&chunk);
+            Err(error) => return self.failed(error),
+        };
+        let outcome = ticket.wait(deadline).await;
+        let private = ticket.private.take();
+        drop(ticket);
+        match outcome {
+            Outcome::Shared(snapshot) if snapshot.is_fresh(Instant::now()) => {
+                snapshot.response(Instant::now())
+            }
+            Outcome::Failed(error) => self.failed(error),
+            Outcome::RetryUnshared if private.is_some() => {
+                match timeout_at(deadline, private.unwrap()).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(_)) => self.failed(FetchError::Internal),
+                    Err(_) => self.failed(FetchError::Timeout),
+                }
+            }
+            Outcome::RetryUnshared | Outcome::Shared(_) => self.private_result(
+                self.upstream
+                    .fetch(
+                        template.request(),
+                        None,
+                        self.upstream_deadline().min(deadline),
+                    )
+                    .await,
+            ),
         }
-        let bytes = bytes::Bytes::from(buffered.into_boxed_slice());
-        if trailers {
-            return Response::from_parts(parts, full(bytes));
-        }
-        let snapshot = Arc::new(Snapshot::new(
-            parts.headers,
-            bytes,
-            freshness,
-            response_time,
-        ));
-        if let Some(fill) = fill {
-            fill.insert(snapshot.clone(), Instant::now());
-        }
-        snapshot.response(Instant::now())
     }
 }
 
-fn reply(status: StatusCode, body: impl Into<bytes::Bytes>) -> Response<ProxyBody> {
-    let mut response = Response::new(full(body));
-    *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, "text/plain; charset=utf-8".parse().unwrap());
-    response
+struct Template {
+    uri: Uri,
+    headers: hyper::HeaderMap,
+}
+
+impl Template {
+    fn request(&self) -> Request<ProxyBody> {
+        let mut request = Request::new(full(bytes::Bytes::new()));
+        *request.uri_mut() = self.uri.clone();
+        *request.headers_mut() = self.headers.clone();
+        request
+    }
 }

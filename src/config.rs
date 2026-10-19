@@ -28,6 +28,14 @@ pub struct Config {
     pub max_cache_entries: usize,
     #[arg(long, default_value_t = 300)]
     pub max_ttl_secs: u64,
+    #[arg(long, default_value_t = 64)]
+    pub max_flights: usize,
+    #[arg(long, default_value_t = 128)]
+    pub max_waiters_per_key: usize,
+    #[arg(long, default_value_t = 1024)]
+    pub max_waiters: usize,
+    #[arg(long, default_value_t = 5000)]
+    pub waiter_timeout_ms: u64,
 }
 
 impl Config {
@@ -87,6 +95,20 @@ impl Config {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cache limits must be positive, entry size must fit cache, entry count at most 1000000, and TTL at most one year",
+            ));
+        }
+        if self.max_flights == 0
+            || self.max_flights > 65_536
+            || self.max_waiters_per_key == 0
+            || self.max_waiters_per_key > 1_000_000
+            || self.max_waiters == 0
+            || self.max_waiters > 1_000_000
+            || self.waiter_timeout_ms == 0
+            || self.waiter_timeout_ms > 86_400_000
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flight/waiter limits must be positive; at most 65536 flights, 1000000 waiters, and one day waiter timeout",
             ));
         }
         Ok(())
