@@ -4,7 +4,7 @@ Status: accepted.
 
 A short synchronous mutex protects a HashMap of immutable snapshots and a BTreeMap of recency ticks. Hits update recency; admission removes expired entries and evicts the least recently used until both byte and entry limits fit. Recency operations are O(log n); expiry cleanup currently scans entries on insertion. No mutex spans an await.
 
-The byte gauge counts body bytes, header data, and both retained key copies. Entry limits bound map/container overhead. Active responses can retain evicted Bytes, so this gauge is not total resident memory. Upstream admission bounds concurrent candidate buffers and mutation/fill tracking. Downstream connection admission bounds active responses.
+The byte gauge counts body bytes, header data, and both retained key copies. Entry limits bound map/container overhead. Active responses can retain evicted Bytes, so this gauge is not total resident memory. Flight, upstream, and downstream admission bound candidate buffering, mutation/fill tracking, and active responses. Waiter permits bound retained flight outcomes and request metadata.
 
 Unsafe attempts invalidate at admission and completion, including failure and cancellation. Each active target has a unique reference-counted version token. Fills may publish only against the same token with no mutation active. New tokens avoid numeric-generation wraparound; simultaneous mutations each fence older work. Drop guards release target tracking, which disappears when its active fills and mutations reach zero.
 

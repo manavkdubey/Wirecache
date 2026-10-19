@@ -8,4 +8,4 @@ If a chunk crosses the limit, the original caller receives the buffered prefix, 
 
 Transfer error or timeout before headers are sent produces 502 or 504. After streaming starts, transfer failure terminates the body. No incomplete body is committed as a cache success. Announced or unannounced trailers prevent admission; trailers are not forwarded in P0.
 
-The upstream permit remains owned through buffering or the streaming body lifetime. Single-flight is not implemented yet; its eventual followers must fetch privately under admission limits after an oversized or otherwise unshareable result.
+The upstream permit remains owned through buffering or the streaming body lifetime. Single-flight followers fetch privately under admission limits after an oversized or otherwise unshareable result. The original response is transferred through a private oneshot; it never enters the shared outcome.

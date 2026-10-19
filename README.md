@@ -1,6 +1,6 @@
 # WireCache
 
-A Rust HTTP/1.1 reverse proxy for one trusted HTTP origin, with an opt-in bounded response cache. Single-flight coordination is the next milestone.
+A Rust HTTP/1.1 reverse proxy for one trusted HTTP origin, with an opt-in bounded response cache and single-flight request coalescing.
 
 ```sh
 cargo run -- --upstream http://127.0.0.1:9000
@@ -9,7 +9,7 @@ curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/metrics
 ```
 
-Use an existing local HTTP server on port 9000. Run `cargo run -- --help` for limits. Ctrl-C stops admission and allows connections five seconds to drain.
+Use an existing local HTTP server on port 9000. Run `cargo run -- --help` for limits. Ctrl-C stops admission, cancels shared fetches with explicit terminal failures, and allows direct connections five seconds to drain.
 
 ## Current behavior
 
@@ -19,7 +19,7 @@ Use an existing local HTTP server on port 9000. Run `cargo run -- --help` for li
 - Upstream capacity exhaustion returns 503 with `Retry-After: 1`. Downstream connection exhaustion closes the newly accepted socket.
 - Upstream failures before response headers return 502; deadline expiry returns 504. Once response headers are sent, transfer failure or timeout terminates the body rather than replacing the status.
 - Known oversized request bodies return 413 before forwarding. Chunked bodies exceeding the limit abort the upstream upload; an origin might already have consumed a prefix. Do not interpret an aborted mutation as proof that the origin made no changes.
-- `/healthz` and `/metrics` are reserved locally for GET/HEAD. Metrics currently count requests, origin attempts, and upstream capacity rejections.
+- `/healthz` and `/metrics` are reserved locally for GET/HEAD. Metrics include requests, origin attempts, overloads, cache accounting, flight creation/joins, unshareable outcomes, active flights, and enrolled waiters.
 
 ## Response caching
 
@@ -40,9 +40,21 @@ Freshness accounts for Date, Age, origin response delay, body buffering, and mon
 
 Unsafe attempts invalidate the same fixed-origin target at admission and completion, even on failure or cancellation. Version tokens prevent older fills from inserting afterward; overlapping mutations block insertion. Tracking exists only while bounded upstream work is active. This is conservative same-target invalidation, not complete RFC invalidation or protection against out-of-band origin changes.
 
-Next: coordinator-owned shared fetches, retained terminal outcomes, follower deadlines, and independently bounded retries for unshareable responses. Concurrent misses currently fetch independently.
+## Single-flight coordination
 
-Decisions: [public-route policy and freshness](docs/adr/ADR-002-cache-policy.md), [oversized responses](docs/adr/ADR-003-body-buffering.md), [LRU accounting and invalidation](docs/adr/ADR-006-cache-storage.md).
+Compatible cache misses join one coordinator-owned fetch. The first caller can disconnect without canceling it. Only verified, complete, fresh snapshots are shared. Every caller gets independent headers and shared immutable body bytes. A retained terminal result prevents a caller from missing completion.
+
+Unshareable responses go privately to the original caller; followers issue independent uncached fetches under upstream limits, without re-entering a flight. If the original caller left, its private response is discarded. Failures broadcast a mapped error and allow a later request to retry. There are no automatic transport retries.
+
+Defaults: 64 active flights (including replaced flights still finishing), 128 enrolled callers per key, 1024 enrolled callers globally, and a five-second waiter deadline. Limits include the first caller and callers still waiting on replaced flights for the same key. Rejection is immediate 503 with `Retry-After: 1`. Caller cancellation releases its waiter slot. Owned tasks continue until completion, origin timeout, or shutdown, even if all callers leave.
+
+Admission rechecks cache and mutation versions under the coordinator lock. Cache publication precedes flight removal; old cleanup checks flight identity before removal. Calls already enrolled before a mutation may complete with their original result, while later callers cannot join that older flight. No synchronous lock spans an await.
+
+The deterministic burst test holds the origin until all 100 callers are enrolled, then verifies one origin request and 100 correct responses. This is a healthy, bounded, compatible-burst guarantee, not exactly-once execution across failures or restarts. Performance and resident-memory benchmarks remain pending.
+
+Next: broader failure/resource hardening, latency instrumentation, CI, and a reproducible benchmark/demo harness.
+
+Decisions: [public-route policy and freshness](docs/adr/ADR-002-cache-policy.md), [oversized responses](docs/adr/ADR-003-body-buffering.md), [flight ownership](docs/adr/ADR-004-flight-lifecycle.md), [publication ordering](docs/adr/ADR-005-flight-publication.md), [LRU accounting and invalidation](docs/adr/ADR-006-cache-storage.md).
 
 ## Verification
 
