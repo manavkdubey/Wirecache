@@ -1,9 +1,10 @@
 use crate::{
     Config,
-    body::{PrefixBody, ProxyBody, StreamBody, full},
+    body::{PrefixBody, ProxyBody, StreamBody, UpstreamLease, full},
     cache::{Fill, Snapshot},
     error::FetchError,
     headers, policy,
+    telemetry::{End, Scope, Telemetry},
 };
 use http_body_util::BodyExt;
 use hyper::{Request, Response, StatusCode, body::Incoming, header::CONTENT_LENGTH};
@@ -12,14 +13,11 @@ use hyper_util::{
     rt::{TokioExecutor, TokioTimer},
 };
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::Semaphore,
     time::{Instant, timeout_at},
 };
 
@@ -33,11 +31,11 @@ pub(crate) struct Upstream {
     config: Config,
     client: Client<HttpConnector, ProxyBody>,
     slots: Arc<Semaphore>,
-    attempts: AtomicU64,
+    telemetry: Arc<Telemetry>,
 }
 
 impl Upstream {
-    pub(crate) fn new(config: &Config) -> Arc<Self> {
+    pub(crate) fn new(config: &Config, telemetry: Arc<Telemetry>) -> Arc<Self> {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(Duration::from_millis(config.upstream_timeout_ms)));
         let client = Client::builder(TokioExecutor::new())
@@ -51,12 +49,8 @@ impl Upstream {
             config: config.clone(),
             client,
             slots: Arc::new(Semaphore::new(config.max_upstream_requests)),
-            attempts: AtomicU64::new(0),
+            telemetry,
         })
-    }
-
-    pub(crate) fn attempts(&self) -> u64 {
-        self.attempts.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn fetch(
@@ -69,13 +63,20 @@ impl Upstream {
             return FetchResult::Failed(FetchError::Overloaded);
         };
         let requested_at = Instant::now();
-        self.attempts.fetch_add(1, Ordering::Relaxed);
+        let mut lease = UpstreamLease::new(permit, self.telemetry.start(Scope::Upstream), deadline);
         let response = match timeout_at(deadline, self.client.request(request)).await {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) => return FetchResult::Failed(FetchError::Transport),
-            Err(_) => return FetchResult::Failed(FetchError::Timeout),
+            Ok(Err(error)) => {
+                let error = FetchError::from_source(&error);
+                lease.finish(error.end());
+                return FetchResult::Failed(error);
+            }
+            Err(_) => {
+                lease.finish(End::Timeout);
+                return FetchResult::Failed(FetchError::Timeout);
+            }
         };
-        self.forward_response(response, fill, requested_at, deadline, permit)
+        self.forward_response(response, fill, requested_at, deadline, lease)
             .await
     }
 
@@ -85,7 +86,7 @@ impl Upstream {
         fill: Option<Fill>,
         requested_at: Instant,
         deadline: Instant,
-        permit: OwnedSemaphorePermit,
+        mut lease: UpstreamLease,
     ) -> FetchResult {
         let received_at = Instant::now();
         let response_time = SystemTime::now();
@@ -103,6 +104,7 @@ impl Upstream {
         if parts.status == StatusCode::SWITCHING_PROTOCOLS
             || headers::sanitize(&mut parts.headers).is_err()
         {
+            lease.finish(End::Transport);
             return FetchResult::Failed(FetchError::Transport);
         }
         let limit = self.config.max_entry_kib * 1024;
@@ -116,33 +118,45 @@ impl Upstream {
         let Some(freshness) =
             freshness.filter(|_| !oversized && parts.headers.contains_key("cache-control"))
         else {
-            return FetchResult::Private(Response::from_parts(
+            let transfer_deadline = lease.deadline();
+            let mut response = Response::from_parts(
                 parts,
-                StreamBody::new(body, deadline, None, Some(permit)).boxed_unsync(),
-            ));
+                StreamBody::new(body, deadline, None, Some(lease)).boxed_unsync(),
+            );
+            response.extensions_mut().insert(transfer_deadline);
+            return FetchResult::Private(response);
         };
         let mut buffered = Vec::new();
+        let mut allocation = self.telemetry.buffer();
         let mut trailers = false;
         loop {
             let frame = match timeout_at(deadline, body.frame()).await {
                 Ok(Some(Ok(frame))) => frame,
                 Ok(Some(Err(_))) => {
+                    lease.finish(End::Transport);
                     return FetchResult::Failed(FetchError::Transport);
                 }
-                Err(_) => return FetchResult::Failed(FetchError::Timeout),
+                Err(_) => {
+                    lease.finish(End::Timeout);
+                    return FetchResult::Failed(FetchError::Timeout);
+                }
                 Ok(None) => break,
             };
             let Ok(chunk) = frame.into_data() else {
                 trailers = true;
                 continue;
             };
+            lease.add_bytes(chunk.len());
             if chunk.len() > limit - buffered.len() {
                 let prefix = bytes::Bytes::from(buffered.into_boxed_slice());
-                let tail = StreamBody::new(body, deadline, None, Some(permit));
-                return FetchResult::Private(Response::from_parts(
+                let transfer_deadline = lease.deadline();
+                let tail = StreamBody::new(body, deadline, None, Some(lease));
+                let mut response = Response::from_parts(
                     parts,
                     PrefixBody::new(prefix, chunk, tail).boxed_unsync(),
-                ));
+                );
+                response.extensions_mut().insert(transfer_deadline);
+                return FetchResult::Private(response);
             }
             let needed = buffered.len() + chunk.len();
             if needed > buffered.capacity() {
@@ -151,10 +165,12 @@ impl Upstream {
                     .unwrap_or(limit)
                     .min(limit);
                 buffered.reserve_exact(capacity - buffered.len());
+                allocation.set_capacity(buffered.capacity());
             }
             buffered.extend_from_slice(&chunk);
         }
         let bytes = bytes::Bytes::from(buffered.into_boxed_slice());
+        lease.finish(End::Success);
         if trailers {
             return FetchResult::Private(Response::from_parts(parts, full(bytes)));
         }

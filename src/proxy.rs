@@ -1,12 +1,4 @@
-use std::{
-    convert::Infallible,
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{convert::Infallible, io, sync::Arc, time::Duration};
 
 use http_body_util::BodyExt;
 use hyper::{
@@ -18,11 +10,12 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::{
     Config,
-    body::{ProxyBody, StreamBody, full},
+    body::{ObservedBody, ProxyBody, StreamBody, full},
     cache::{Cache, CacheKey},
     error::{FetchError, reply},
     flight::{Admission, Coordinator, Outcome},
     headers, policy,
+    telemetry::{Scope, Telemetry},
     upstream::{FetchResult, Upstream},
 };
 
@@ -30,8 +23,7 @@ pub struct Proxy {
     pub(crate) config: Config,
     upstream: Arc<Upstream>,
     flights: Arc<Coordinator>,
-    requests: AtomicU64,
-    overloads: AtomicU64,
+    pub(crate) telemetry: Arc<Telemetry>,
     cache: Arc<Cache>,
 }
 
@@ -43,13 +35,13 @@ impl Proxy {
             config.max_cache_entries,
             config.max_entry_kib * 1024,
         );
+        let telemetry = Arc::new(Telemetry::default());
         Ok(Arc::new(Self {
-            upstream: Upstream::new(&config),
+            upstream: Upstream::new(&config, telemetry.clone()),
             flights: Coordinator::new(cache.clone(), &config),
             config,
             cache,
-            requests: AtomicU64::new(0),
-            overloads: AtomicU64::new(0),
+            telemetry,
         }))
     }
 
@@ -59,9 +51,22 @@ impl Proxy {
 
     pub(crate) async fn handle(
         &self,
+        request: Request<Incoming>,
+    ) -> Result<Response<ProxyBody>, Infallible> {
+        let head = request.method() == hyper::Method::HEAD;
+        let mut observation = self.telemetry.start(Scope::Request);
+        let response = self.route(request).await?;
+        self.telemetry.response(response.status());
+        if head {
+            observation.finish(crate::telemetry::End::Success);
+        }
+        Ok(response.map(|body| ObservedBody::new(body, observation).boxed_unsync()))
+    }
+
+    async fn route(
+        &self,
         mut request: Request<Incoming>,
     ) -> Result<Response<ProxyBody>, Infallible> {
-        self.requests.fetch_add(1, Ordering::Relaxed);
         if request.version() != Version::HTTP_11 {
             return Ok(reply(
                 StatusCode::HTTP_VERSION_NOT_SUPPORTED,
@@ -88,12 +93,7 @@ impl Proxy {
             if request.uri().path() == "/healthz" {
                 return Ok(reply(StatusCode::OK, "ok\n"));
             }
-            let metrics = format!(
-                "wirecache_requests_total {}\nwirecache_origin_requests_total {}\nwirecache_overloads_total {}\n",
-                self.requests.load(Ordering::Relaxed),
-                self.upstream.attempts(),
-                self.overloads.load(Ordering::Relaxed)
-            );
+            let metrics = self.telemetry.render();
             let stats = self.cache.stats();
             let metrics = format!(
                 "{metrics}wirecache_cache_bytes {}\nwirecache_cache_entries {}\nwirecache_cache_hits_total {}\nwirecache_cache_misses_total {}\nwirecache_cache_evictions_total {}\n",
@@ -200,7 +200,7 @@ impl Proxy {
 
     fn failed(&self, error: FetchError) -> Response<ProxyBody> {
         if error == FetchError::Overloaded {
-            self.overloads.fetch_add(1, Ordering::Relaxed);
+            self.telemetry.overload();
         }
         error.response()
     }
@@ -236,7 +236,12 @@ impl Proxy {
             }
             Err(error) => return self.failed(error),
         };
+        let mut waiting = self.telemetry.start(Scope::Wait);
         let outcome = ticket.wait(deadline).await;
+        waiting.finish(match &outcome {
+            Outcome::Failed(error) => error.end(),
+            _ => crate::telemetry::End::Success,
+        });
         let private = ticket.private.take();
         drop(ticket);
         match outcome {

@@ -300,6 +300,7 @@ fn rejects_invalid_origin_and_limits() {
         ("--max-waiters", "0"),
         ("--max-waiters-per-key", "0"),
         ("--waiter-timeout-ms", "0"),
+        ("--connection-idle-timeout-ms", "0"),
     ] {
         let config = Config::try_parse_from([
             "wirecache",

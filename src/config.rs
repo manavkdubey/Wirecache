@@ -36,6 +36,8 @@ pub struct Config {
     pub max_waiters: usize,
     #[arg(long, default_value_t = 5000)]
     pub waiter_timeout_ms: u64,
+    #[arg(long, default_value_t = 10_000)]
+    pub connection_idle_timeout_ms: u64,
 }
 
 impl Config {
@@ -109,6 +111,12 @@ impl Config {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "flight/waiter limits must be positive; at most 65536 flights, 1000000 waiters, and one day waiter timeout",
+            ));
+        }
+        if self.connection_idle_timeout_ms == 0 || self.connection_idle_timeout_ms > 86_400_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "connection idle timeout must be positive and at most one day",
             ));
         }
         Ok(())

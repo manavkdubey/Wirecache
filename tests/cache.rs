@@ -8,18 +8,21 @@ use std::{
 };
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::{
     Request, Response, StatusCode, body::Incoming, header::HeaderMap, service::service_fn,
 };
 use hyper_util::rt::TokioIo;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::Semaphore,
     task::{JoinHandle, JoinSet},
 };
 
+#[path = "support/client.rs"]
+mod client;
+use client::request;
 mod support;
 use support::RunningProxy;
 
@@ -114,40 +117,6 @@ impl Fixture {
     fn count(&self) -> usize {
         self.count.load(Ordering::SeqCst)
     }
-}
-
-async fn request(
-    address: std::net::SocketAddr,
-    method: &str,
-    path: &str,
-    extra: &[(&str, &str)],
-) -> Response<Bytes> {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        let stream = TcpStream::connect(address).await.unwrap();
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .unwrap();
-        let connection = tokio::spawn(connection);
-        let mut request = Request::builder()
-            .method(method)
-            .uri(path)
-            .header("host", "client.example")
-            .header("connection", "close");
-        for (name, value) in extra {
-            request = request.header(*name, *value);
-        }
-        let response = sender
-            .send_request(request.body(Full::new(Bytes::new())).unwrap())
-            .await
-            .unwrap();
-        let (parts, body) = response.into_parts();
-        let body = body.collect().await.unwrap().to_bytes();
-        drop(sender);
-        connection.await.unwrap().unwrap();
-        Response::from_parts(parts, body)
-    })
-    .await
-    .unwrap()
 }
 
 impl Drop for Fixture {

@@ -574,4 +574,26 @@ mod tests {
         let (_, work) = start(&coordinator, "a");
         drop(work);
     }
+
+    #[tokio::test]
+    async fn one_thousand_distinct_misses_keep_registry_and_waiters_bounded() {
+        let coordinator = setup(&["--max-flights", "4", "--max-waiters", "16"]);
+        let mut admitted = Vec::new();
+        let mut rejected = 0;
+        for number in 0..1000 {
+            match coordinator.admit(key(&number.to_string())) {
+                Ok(Admission::Start(ticket, work)) => admitted.push((ticket, work)),
+                Err(FetchError::Overloaded) => rejected += 1,
+                _ => panic!("unexpected admission"),
+            }
+        }
+        assert_eq!(admitted.len(), 4);
+        assert_eq!(rejected, 996);
+        assert_eq!(coordinator.stats().active, 4);
+        assert_eq!(coordinator.stats().waiters, 4);
+        drop(admitted);
+        assert_eq!(coordinator.stats().active, 0);
+        assert!(coordinator.state.lock().unwrap().flights.is_empty());
+        assert!(coordinator.state.lock().unwrap().waiters.is_empty());
+    }
 }
