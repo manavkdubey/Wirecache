@@ -141,6 +141,7 @@ Memory upper bound should be explainable: cache cap + (max concurrent eligible f
 
 ## 9. Timeouts, overload, shutdown
 - Connect timeout, total origin response timeout, body-read timeout, downstream waiter timeout.
+- Monitor active-origin streaming deadlines and configurable connection inactivity independently of body polling. Successful transfer completion disarms its deadline; see [resource bounds](docs/RESOURCE_LIMITS.md).
 - Global semaphore for upstream requests including bypass; limits for concurrent flights; cap waiters and key count.
 - On limit hit, default 503 + `Retry-After: 1`; do not overflow arbitrary queues.
 - Clean shutdown rejects new requests, finishes/aborts flights within deadline, publishes terminal cancellation if possible and drains active connections.
@@ -150,6 +151,7 @@ Memory upper bound should be explainable: cache cap + (max concurrent eligible f
 **Counters:** total requests by result, upstream attempts by outcome, cache hits/misses, flight created/joined, rejects, fallback to unshared, cache evictions, expiration.
 **Gauges:** cache bytes/entries, active flights, waiters, active upstream calls.
 **Histograms:** upstream latency, proxy end-to-end latency, wait duration, body bytes.
+Implemented proxy-side latency observations end at body production/consumption, failure, or cancellation; they cannot measure peer receipt. Client-measured end-to-end distributions belong to the benchmark harness. See [metric semantics](docs/METRICS.md).
 Avoid high-cardinality labels (URL/user IDs) and sensitive HTTP header logging.
 
 Four benchmark modes: direct origin, proxy without cache, proxy warm hit, proxy cold burst. Emit JSON/CSV artifacts to `bench/results/` with command, machine, times, payloads, counters. Distinguish throughput from origin fetch suppression. Compare on identical upstream conditions and advertise representative distributions, not cherry-picked best runs.

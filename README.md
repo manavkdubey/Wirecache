@@ -15,11 +15,11 @@ Use an existing local HTTP server on port 9000. Run `cargo run -- --help` for li
 
 - One pooled HTTP client; client Host and absolute request targets cannot select another upstream.
 - Request methods, encoded paths, query order, status, and end-to-end headers are preserved. Connection-specific headers and trailers are removed; Hyper rebuilds framing.
-- Bodies stream with backpressure. Defaults: 128 downstream connections, 64 active upstream exchanges, 8 MiB request bodies, 3-second upstream exchange deadline, 100 request headers, and 32 KiB HTTP read buffers.
+- Bodies stream with backpressure. Defaults: 128 downstream connections, 64 active upstream exchanges, 8 MiB forwarded request bodies, 3-second upstream exchange deadline, 10-second connection idle timeout, 100 request headers, and 32 KiB HTTP read buffers.
 - Upstream capacity exhaustion returns 503 with `Retry-After: 1`. Downstream connection exhaustion closes the newly accepted socket.
 - Upstream failures before response headers return 502; deadline expiry returns 504. Once response headers are sent, transfer failure or timeout terminates the body rather than replacing the status.
-- Known oversized request bodies return 413 before forwarding. Chunked bodies exceeding the limit abort the upstream upload; an origin might already have consumed a prefix. Do not interpret an aborted mutation as proof that the origin made no changes.
-- `/healthz` and `/metrics` are reserved locally for GET/HEAD. Metrics include requests, origin attempts, overloads, cache accounting, flight creation/joins, unshareable outcomes, active flights, and enrolled waiters.
+- Known oversized request bodies return 413 before forwarding. Chunked uploads crossing the limit abort forwarding and return 413 if response headers have not been sent; stalled uploads return 504. An origin might already have consumed a prefix or answered early. Do not interpret an aborted mutation as proof that the origin made no changes.
+- `/healthz` and `/metrics` are reserved locally for GET/HEAD. Metrics include cache/flight accounting, latency histograms, fixed outcome/status labels, active connections/upstream exchanges, candidate-buffer capacity and peak, and connection rejection/timeout/error counters. See [metric definitions](docs/METRICS.md).
 
 ## Response caching
 
@@ -52,7 +52,9 @@ Admission rechecks cache and mutation versions under the coordinator lock. Cache
 
 The deterministic burst test holds the origin until all 100 callers are enrolled, then verifies one origin request and 100 correct responses. This is a healthy, bounded, compatible-burst guarantee, not exactly-once execution across failures or restarts. Performance and resident-memory benchmarks remain pending.
 
-Next: broader failure/resource hardening, latency instrumentation, CI, and a reproducible benchmark/demo harness.
+Connection idle and active-origin transfer deadlines are monitored independently of body polling. A stalled reader cannot keep an origin permit indefinitely by preventing the next body poll. Successful transfer completion disarms its deadline, preserving subsequent keep-alive use. See [resource limits and memory model](docs/RESOURCE_LIMITS.md).
+
+Next: CI and a reproducible benchmark/demo harness, including actual resident-memory measurements.
 
 Decisions: [public-route policy and freshness](docs/adr/ADR-002-cache-policy.md), [oversized responses](docs/adr/ADR-003-body-buffering.md), [flight ownership](docs/adr/ADR-004-flight-lifecycle.md), [publication ordering](docs/adr/ADR-005-flight-publication.md), [LRU accounting and invalidation](docs/adr/ADR-006-cache-storage.md).
 
@@ -68,6 +70,6 @@ Dependencies must be downloaded first. Integration tests use local TCP sockets a
 
 ## Scope and limitations
 
-Local development with a trusted origin, loopback by default. Not suitable for public exposure: there is no TLS, authentication, or full RFC 9111 cache. HTTP/2, CONNECT, upgrades, and trailers are unsupported. Body deadlines are checked while polling bodies; a stalled downstream socket can retain its bounded connection slot until disconnect or shutdown. Transport buffering and concurrency are bounded, but resident-memory benchmarking has not been performed.
+Local development with a trusted origin, loopback by default. Not suitable for public exposure: there is no TLS, authentication, or full RFC 9111 cache. HTTP/2, CONNECT, upgrades, and trailers are unsupported. Timeouts may terminate an already-started body; its status cannot then be replaced. An active keep-alive connection has no fixed lifetime, and fully buffered/cache-hit delivery uses the idle policy. Logical buffers and concurrency are bounded; resident-memory benchmarking has not been performed.
 
 Requirements: [PRD](WireCache_PRD.md), [technical design](WireCache_Technical_Design.md), and [collaboration guidelines](WireCache_Agent_Prompt.md).
