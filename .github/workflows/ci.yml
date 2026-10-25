@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      TOKIO_WORKER_THREADS: 2
+    steps:
+      - name: Checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install stable Rust tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Formatting
+        run: cargo +stable fmt --check
+      - name: Clippy
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Rust tests
+        run: cargo +stable test --locked
+      - name: Benchmark analysis tests
+        run: python3 -m unittest discover -s scripts/tests
+      - name: Build release binaries
+        run: cargo +stable build --release --locked --bin wirecache --examples
+      - name: Stampede demo
+        run: python3 scripts/bench.py --demo --output "$RUNNER_TEMP/wirecache-demo"
