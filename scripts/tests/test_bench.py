@@ -1,5 +1,8 @@
 import importlib.util
+import gzip
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location("bench", Path(__file__).resolve().parents[1] / "bench.py")
@@ -42,6 +45,14 @@ class BenchmarkTests(unittest.TestCase):
         stat = "42 (worker ) name) " + " ".join(fields)
         result = bench.parse_proc_stats("VmRSS:\t100 kB\nVmHWM:\t200 kB\n", stat, 100)
         self.assertEqual(result, {"cpu_seconds": 0.3, "rss_kib": 100, "lifetime_peak_rss_kib": 200})
+
+    def test_compressed_raw_samples_round_trip_without_losing_errors_or_latency(self):
+        raw = {"elapsed_seconds": 1, "samples": [{"latency_ns": 123, "outcome": "success"}, {"latency_ns": 456, "outcome": "timeout"}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "samples.json.gz"
+            bench.write_samples(path, raw)
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), raw)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import argparse
 import collections
 import csv
 import datetime
+import gzip
 import hashlib
 import http.client
 import json
@@ -189,6 +190,11 @@ def measured_load(command, environment, stderr_path, before, processes):
                 process.wait()
 
 
+def write_samples(path, raw):
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        json.dump(raw, handle, separators=(",", ":"))
+
+
 def case(mode, repetition, args, output, environment):
     stem = f"{mode}-{repetition}"
     origin_port = free_port()
@@ -198,7 +204,7 @@ def case(mode, repetition, args, output, environment):
     while proxy_port == origin_port:
         proxy_port = free_port()
     concurrency = args.burst if mode == "cold_burst" or args.demo else args.concurrency
-    requests = args.burst if mode == "cold_burst" or args.demo else args.requests
+    requests = args.burst if mode == "cold_burst" or args.demo else args.warm_requests if mode == "warm_cache" else args.requests
     target_port = origin_port if mode == "direct" else proxy_port
     path = f"/public/data?mode={mode}&repetition={repetition}"
     url = f"http://127.0.0.1:{target_port}{path}"
@@ -237,7 +243,7 @@ def case(mode, repetition, args, output, environment):
                       "resources": resources, "checks": checks,
                       "commands": {"origin": origin_command, "load": load_command, "proxy": proxy_command if mode != "direct" else None},
                       "metrics_before": initial["proxy"], "metrics_after": final["proxy"]}
-            (output / f"{stem}.samples.json").write_text(json.dumps(raw, indent=2) + "\n")
+            write_samples(output / f"{stem}.samples.json.gz", raw)
             return result
 
         if mode == "direct":
@@ -272,6 +278,7 @@ def metadata(args):
         "python": platform.python_version(), "tokio_worker_threads": args.worker_threads,
         "payload_bytes": args.payload_bytes, "origin_delay_ms": args.delay_ms, "origin_ttl_seconds": 60,
         "requests": args.requests, "concurrency": args.concurrency, "cold_burst_requests": args.burst,
+        "warm_cache_requests": args.warm_requests, "raw_sample_format": "gzip-compressed JSON; every request retained",
         "repetitions": args.repetitions, "sample_interval_seconds": 0.01,
         "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
         "load_generator": "examples/load.rs; closed-loop HTTP/1.1 pooled client; synchronized initial wave",
@@ -294,6 +301,7 @@ def write_report(output, report):
 def main():
     parser = argparse.ArgumentParser(description="Reproducible local WireCache benchmark (Linux /proc required)")
     parser.add_argument("--requests", type=int, default=600)
+    parser.add_argument("--warm-requests", type=int, default=100_000)
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--burst", type=int, default=100)
     parser.add_argument("--delay-ms", type=int, default=200)
@@ -305,7 +313,7 @@ def main():
     args = parser.parse_args()
     if not Path("/proc/self/status").exists():
         parser.error("this resource-measurement harness requires Linux /proc")
-    if not (1 <= args.requests <= 1_000_000 and 1 <= args.concurrency <= 256 and 2 <= args.burst <= 256
+    if not (1 <= args.requests <= 1_000_000 and 1 <= args.warm_requests <= 1_000_000 and 1 <= args.concurrency <= 256 and 2 <= args.burst <= 256
             and 0 <= args.delay_ms <= 1000 and 1 <= args.payload_bytes <= 1024 * 1024
             and 1 <= args.worker_threads <= 64 and 1 <= args.repetitions <= 20):
         parser.error("invalid workload limits; see --help")
