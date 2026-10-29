@@ -292,7 +292,7 @@ def write_report(output, report):
     (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     fields = ["mode", "repetition", "requests", "concurrency", "errors", "elapsed_seconds", "throughput_rps", "p50_ms", "p95_ms", "p99_ms", "origin_requests", "compatible_misses", "flight_joins", "coalescing_factor"]
     with (output / "summary.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         for result in report["results"]:
             writer.writerow({key: result[key] for key in fields})

@@ -54,6 +54,14 @@ class BenchmarkTests(unittest.TestCase):
             with gzip.open(path, "rt", encoding="utf-8") as handle:
                 self.assertEqual(json.load(handle), raw)
 
+    def test_report_csv_uses_portable_lf_line_endings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            bench.write_report(directory, {"results": []})
+            raw = (directory / "summary.csv").read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r", raw)
+
 
 if __name__ == "__main__":
     unittest.main()
