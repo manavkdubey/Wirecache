@@ -1,6 +1,6 @@
 # WireCache — Technical Design
 
-**Status:** Proposed, implementation-ready design with deliberate review checkpoints.
+**Status:** P0 implemented with regression tests, ADRs, and [reference benchmarks](docs/BENCHMARKS.md). P1/P2 remain out of scope.
 
 ## 0. Design contract
 Implement a **single-process, single-trusted-origin, HTTP/1.1** reverse proxy. The primary engineering contribution is correct single-flight **only for compatible, conservatively cacheable candidate GETs**. The cache is not a general RFC-compliant shared cache. Never claim exactly-once upstream fetching under failures or across process restarts; claim one upstream fetch for a deterministic simultaneously pending compatible burst when healthy and inside configured bounds.

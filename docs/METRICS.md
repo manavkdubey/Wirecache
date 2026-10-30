@@ -14,7 +14,7 @@ These are classic cumulative histograms in seconds, with finite boundaries from 
 
 Each scope has `wirecache_{scope}_outcomes_total{outcome="success|timeout|transport|limit|cancelled"}`. These describe scope/body completion, not HTTP success. A successfully produced 504 response body has request outcome `success`; its HTTP class is separately counted by `wirecache_responses_total{class="5xx"}`. Response-class counters describe application-prepared responses; Hyper parser failures are connection errors and may generate their own response.
 
-Request timing ends when the body is produced, not when the peer acknowledges or consumes all bytes. Client-measured end-to-end latency must come from the benchmark harness. An early client disconnect may occur after body production was already counted as successful.
+Request timing ends when the body is produced, not when the peer acknowledges or consumes all bytes. [The benchmark harness](BENCHMARKS.md) supplies client-measured end-to-end latency. An early client disconnect may occur after body production was already counted as successful.
 
 ## Resources and bytes
 

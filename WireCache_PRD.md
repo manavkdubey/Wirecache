@@ -1,6 +1,6 @@
 # WireCache — Product Requirements Document
 
-**Version:** 1.0 | **Status:** Ready for implementation | **Audience:** developer, reviewer, technical interviewer
+**Version:** 1.0 | **Status:** P0 implemented; see [release evidence](docs/RELEASE.md) | **Audience:** developer, reviewer, technical interviewer
 
 ## 1. Executive summary
 WireCache is a single-instance Rust HTTP/1.1 reverse proxy with an opt-in, conservative shared response cache. Its core feature is **single-flight request coalescing**: many simultaneous compatible cache misses cause one upstream fetch, while each caller receives a correct independent response. It exposes benchmarks and failure-injection tests that demonstrate the guarantees rather than merely claiming speed.

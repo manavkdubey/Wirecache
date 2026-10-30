@@ -1,75 +1,94 @@
 # WireCache
 
-A Rust HTTP/1.1 reverse proxy for one trusted HTTP origin, with an opt-in bounded response cache and single-flight request coalescing.
+[![CI](https://github.com/manavkdubey/Wirecache/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/manavkdubey/Wirecache/actions/workflows/ci.yml)
+
+A single-origin Rust HTTP/1.1 reverse proxy with conservative response caching and cancellation-safe single-flight coalescing. In the controlled concurrency test, **100 compatible pending misses produce one origin fetch**, while each caller receives its own correct response.
+
+This is a portfolio systems project: bounded work, explicit failure behavior, privacy regression tests, and reproducible measurements. It does not claim production CDN readiness or full RFC 9111 conformance.
+
+## Run the demo
+
+Requires stable Rust and Python 3 on Linux. Scripts build release binaries, start their own loopback services on temporary ports, and clean up only their own processes.
 
 ```sh
-cargo run -- --upstream http://127.0.0.1:9000
-curl -i 'http://127.0.0.1:8080/products?q=1'
-curl http://127.0.0.1:8080/healthz
+./scripts/demo_stampede.sh
+```
+
+The demo compares 100 pass-through requests with a 100-client cold burst: the origin should see **100 requests versus 1**, with zero client errors. Commands and a manual two-terminal version are in [the demo guide](docs/DEMO.md).
+
+To use your own trusted HTTP origin:
+
+```sh
+cargo run --release -- --upstream http://127.0.0.1:9000 --cache-path-prefix /public/
+curl -s -D - -o /dev/null -H 'User-Agent:' http://127.0.0.1:8080/public/data
 curl http://127.0.0.1:8080/metrics
 ```
 
-Use an existing local HTTP server on port 9000. Run `cargo run -- --help` for limits. Ctrl-C stops admission, cancels shared fetches with explicit terminal failures, and allows direct connections five seconds to drain.
+The origin must explicitly mark the response public and fresh. Curl's default User-Agent is removed because extra headers deliberately bypass the fixed cache profile. Caching is disabled when no public prefix is configured. `cargo run -- --help` lists limits; `/healthz` and `/metrics` are reserved locally.
 
-## Current behavior
+## How it works
 
-- One pooled HTTP client; client Host and absolute request targets cannot select another upstream.
-- Request methods, encoded paths, query order, status, and end-to-end headers are preserved. Connection-specific headers and trailers are removed; Hyper rebuilds framing.
-- Bodies stream with backpressure. Defaults: 128 downstream connections, 64 active upstream exchanges, 8 MiB forwarded request bodies, 3-second upstream exchange deadline, 10-second connection idle timeout, 100 request headers, and 32 KiB HTTP read buffers.
-- Upstream capacity exhaustion returns 503 with `Retry-After: 1`. Downstream connection exhaustion closes the newly accepted socket.
-- Upstream failures before response headers return 502; deadline expiry returns 504. Once response headers are sent, transfer failure or timeout terminates the body rather than replacing the status.
-- Known oversized request bodies return 413 before forwarding. Chunked uploads crossing the limit abort forwarding and return 413 if response headers have not been sent; stalled uploads return 504. An origin might already have consumed a prefix or answered early. Do not interpret an aborted mutation as proof that the origin made no changes.
-- `/healthz` and `/metrics` are reserved locally for GET/HEAD. Metrics include cache/flight accounting, latency histograms, fixed outcome/status labels, active connections/upstream exchanges, candidate-buffer capacity and peak, and connection rejection/timeout/error counters. See [metric definitions](docs/METRICS.md).
-
-## Response caching
-
-Caching is disabled unless an explicitly public route prefix is configured:
-
-```sh
-cargo run -- --upstream http://127.0.0.1:9000 --cache-path-prefix /public/
-curl -i -H 'User-Agent:' http://127.0.0.1:8080/public/data
+```mermaid
+flowchart TD
+    C[HTTP/1.1 clients] --> P{Public fixed-profile GET?}
+    P -- no --> B[Private streaming through pooled client]
+    P -- yes --> H{Fresh cache entry?}
+    H -- yes --> R[Independent response]
+    H -- no --> F[Bounded flight admission and cache recheck]
+    F --> O[Coordinator-owned origin fetch]
+    O --> V{Safe complete fresh body?}
+    V -- yes --> S[Cache and retained shared snapshot]
+    S --> R
+    V -- no --> L[Private response to original caller]
+    V -- no --> Q[Followers fetch independently]
+    Q --> B
+    L --> R
+    B --> R
 ```
 
-The origin must mark the response `Cache-Control: public, max-age=N` or `s-maxage=N`. Only complete 200 responses without cookies, Vary, content encoding, ranges, or trailers qualify. Unknown or malformed cache directives bypass storage.
+- Only bodyless GETs on explicitly public paths qualify. Authorization, cookies, ranges, conditionals, request directives, extra headers, and encoded/dot-segment paths bypass caching and coalescing. Candidate Host/Accept/Accept-Encoding are standardized.
+- Only complete bounded 200 responses with explicit shared freshness qualify. Vary, cookies, private/no-store/no-cache, content encoding/ranges, trailers, and ambiguous directives prevent sharing/storage. Date, Age, buffering time, and monotonic residence determine remaining freshness.
+- Owned fetches survive caller disconnects. Retained terminal outcomes prevent missed wakeups; every waiter has a deadline. Unsafe responses use a private handoff, with bounded independent follower fetches.
+- Same-target mutations invalidate entries and version tokens. Later callers cannot join older flights, and old completion cannot erase a replacement or refill stale storage.
+- LRU storage, connections, origin calls, flights, and waiters have explicit bounds. Candidate overflow replays every buffered byte and streams privately. Independent idle and origin-transfer watchdogs release stalled connections and permits.
 
-The fixed request profile accepts only Host, bodyless framing, Connection close/keep-alive, Accept `*/*`, and Accept-Encoding `identity`. Missing Accept/Accept-Encoding are standardized. Every other header bypasses caching, including User-Agent, authorization, cookies, conditionals, and cache directives. This is why the example removes curl's default User-Agent. Encoded paths and dot segments also bypass. Query bytes and order remain part of the key.
+Defaults: 64 MiB accounted cache data, 4096 entries, 1 MiB per candidate body, 128 connections, 64 origin calls/flights, 128 callers per key, 1024 total waiters, three-second origin deadline, five-second waiter deadline, and ten-second network inactivity limit. Overload returns 503 with Retry-After; connection admission overflow closes the new socket. Ctrl-C cancels shared work and drains direct connections for up to five seconds.
 
-Defaults: 64 MiB of accounted cache data, 4096 entries, 1 MiB per body, and 300 seconds maximum local retention. LRU eviction respects byte and entry limits. Accounting includes body, header, and key data; entry count bounds container overhead. These gauges are not a resident-memory measurement. Active responses can retain evicted snapshots, and candidate buffering adds up to one entry limit per active fetch plus transport buffers and transient copies.
+## Recorded measurements
 
-Freshness accounts for Date, Age, origin response delay, body buffering, and monotonic residence time. Cache hits include updated Age. Candidate overflow privately replays buffered bytes and streams the remainder; partial transfers never enter storage.
+Local reference: AMD Ryzen 7 4800H, Linux, Rust 1.99.1, two Tokio workers per process, 4 KiB responses, 200 ms origin delay, and three repetitions. Values below are medians of run-level results; proxy RSS is the maximum recorded across those runs. **All 12 cases had zero errors.**
 
-Unsafe attempts invalidate the same fixed-origin target at admission and completion, even on failure or cancellation. Version tokens prevent older fills from inserting afterward; overlapping mutations block insertion. Tracking exists only while bounded upstream work is active. This is conservative same-target invalidation, not complete RFC invalidation or protection against out-of-band origin changes.
+| Mode | Requests / concurrency per run | p99 ms | Requests/s | Origin fetches | Proxy peak RSS MiB |
+|---|---:|---:|---:|---:|---:|
+| Direct origin | 600 / 32 | 202.71 | 156.53 | 600 | — |
+| Pass-through | 600 / 32 | 203.44 | 156.09 | 600 | 6.75 |
+| Warm cache | 100,000 / 32 | 0.78 | 72,339.41 | 0 | 6.04 |
+| Cold burst | 100 / 100 | 203.68 | 490.06 | 1 | 7.02 |
 
-## Single-flight coordination
-
-Compatible cache misses join one coordinator-owned fetch. The first caller can disconnect without canceling it. Only verified, complete, fresh snapshots are shared. Every caller gets independent headers and shared immutable body bytes. A retained terminal result prevents a caller from missing completion.
-
-Unshareable responses go privately to the original caller; followers issue independent uncached fetches under upstream limits, without re-entering a flight. If the original caller left, its private response is discarded. Failures broadcast a mapped error and allow a later request to retry. There are no automatic transport retries.
-
-Defaults: 64 active flights (including replaced flights still finishing), 128 enrolled callers per key, 1024 enrolled callers globally, and a five-second waiter deadline. Limits include the first caller and callers still waiting on replaced flights for the same key. Rejection is immediate 503 with `Retry-After: 1`. Caller cancellation releases its waiter slot. Owned tasks continue until completion, origin timeout, or shutdown, even if all callers leave.
-
-Admission rechecks cache and mutation versions under the coordinator lock. Cache publication precedes flight removal; old cleanup checks flight identity before removal. Calls already enrolled before a mutation may complete with their original result, while later callers cannot join that older flight. No synchronous lock spans an await.
-
-The deterministic burst test holds the origin until all 100 callers are enrolled, then verifies one origin request and 100 correct responses. This is a healthy, bounded, compatible-burst guarantee, not exactly-once execution across failures or restarts. Performance and resident-memory benchmarks remain pending.
-
-Connection idle and active-origin transfer deadlines are monitored independently of body polling. A stalled reader cannot keep an origin permit indefinitely by preventing the next body poll. Successful transfer completion disarms its deadline, preserving subsequent keep-alive use. See [resource limits and memory model](docs/RESOURCE_LIMITS.md).
-
-Next: CI and a reproducible benchmark/demo harness, including actual resident-memory measurements.
-
-Decisions: [public-route policy and freshness](docs/adr/ADR-002-cache-policy.md), [oversized responses](docs/adr/ADR-003-body-buffering.md), [flight ownership](docs/adr/ADR-004-flight-lifecycle.md), [publication ordering](docs/adr/ADR-005-flight-publication.md), [LRU accounting and invalidation](docs/adr/ADR-006-cache-storage.md).
-
-## Verification
+The cold burst is one batch, not sustained throughput. These are shared-environment microbenchmarks with a small working set, not production capacity or worst-case memory claims. See [methodology, p50/p95, CPU, and caveats](docs/BENCHMARKS.md), [raw data](bench/reference/2026-10-31/), and [resume facts](docs/RESUME.md).
 
 ```sh
+./scripts/bench.sh
+```
+
+New JSON, CSV, compressed raw samples, and process logs go into an ignored timestamped `bench/results/` directory. Warmup is excluded, origin counters are measured, and the harness rejects failed correctness checks.
+
+## Verify
+
+```sh
+cargo fetch --locked
 cargo fmt --check
-cargo clippy --offline --all-targets -- -D warnings
-cargo test --offline
+cargo clippy --offline --locked --all-targets -- -D warnings
+cargo test --offline --locked
+python3 -m unittest discover -s scripts/tests
 ```
 
-Dependencies must be downloaded first. Integration tests use local TCP sockets and controlled origin gates; no external service is needed.
+The suite contains **71 Rust tests and 7 Python analysis/export tests**, including controlled multithreaded coalescing, cancellation/panic cleanup, privacy, framing, mutation races, stalled readers/uploads, admission pressure, and buffer accounting. CI runs checks, release builds, and the stampede demo.
 
-## Scope and limitations
+## Scope and design record
 
-Local development with a trusted origin, loopback by default. Not suitable for public exposure: there is no TLS, authentication, or full RFC 9111 cache. HTTP/2, CONNECT, upgrades, and trailers are unsupported. Timeouts may terminate an already-started body; its status cannot then be replaced. An active keep-alive connection has no fixed lifetime, and fully buffered/cache-hit delivery uses the idle policy. Logical buffers and concurrency are bounded; resident-memory benchmarking has not been performed.
+P0 is implemented. P1 features such as validator revalidation and selected Vary variants are future work. TLS, HTTP/2/3, tunnels, distributed coordination, persistence, arbitrary origins, and production CDN behavior are outside scope. Updates outside this proxy and related-URL invalidation are not observed. Already-started body failures terminate the connection; they cannot replace the status. Healthy keep-alive connections have no fixed lifetime.
 
-Requirements: [PRD](WireCache_PRD.md), [technical design](WireCache_Technical_Design.md), and [collaboration guidelines](WireCache_Agent_Prompt.md).
+Read the [threat model](docs/THREAT_MODEL.md), [resource/memory model](docs/RESOURCE_LIMITS.md), [metric semantics](docs/METRICS.md), and [release review](docs/RELEASE.md). Decisions: [fixed origin](docs/adr/ADR-001-fixed-origin.md), [cache policy](docs/adr/ADR-002-cache-policy.md), [buffering](docs/adr/ADR-003-body-buffering.md), [flight ownership](docs/adr/ADR-004-flight-lifecycle.md), [publication ordering](docs/adr/ADR-005-flight-publication.md), and [LRU/invalidation](docs/adr/ADR-006-cache-storage.md).
+
+Requirements and workflow: [PRD](WireCache_PRD.md), [technical design](WireCache_Technical_Design.md), [agent guidelines](WireCache_Agent_Prompt.md). Git history is an explicitly labeled reconstruction; benchmark artifacts retain actual measurement timestamps.
