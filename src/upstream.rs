@@ -64,9 +64,8 @@ impl Upstream {
         };
         let stale = fill.as_ref().and_then(Fill::take_stale);
         if let Some(snapshot) = &stale {
-            request
-                .headers_mut()
-                .insert("if-none-match", snapshot.etag().unwrap().clone());
+            let (name, value) = snapshot.validator().unwrap();
+            request.headers_mut().insert(name, value.clone());
         }
         let requested_at = Instant::now();
         let mut lease = UpstreamLease::new(permit, self.telemetry.start(Scope::Upstream), deadline);

@@ -1,6 +1,6 @@
 # WireCache — Technical Design
 
-**Status:** P0 implemented with regression tests, ADRs, and [reference benchmarks](docs/BENCHMARKS.md). ETag revalidation is implemented as a P1 extension ([ADR-007](docs/adr/ADR-007-etag-revalidation.md)); other P1/P2 features remain future work.
+**Status:** P0 implemented with regression tests, ADRs, and [reference benchmarks](docs/BENCHMARKS.md). ETag and Last-Modified revalidation are implemented as a P1 extension ([ADR-007](docs/adr/ADR-007-etag-revalidation.md)); other P1/P2 features remain future work.
 
 ## 0. Design contract
 Implement a **single-process, single-trusted-origin, HTTP/1.1** reverse proxy. The primary engineering contribution is correct single-flight **only for compatible, conservatively cacheable candidate GETs**. The cache is not a general RFC-compliant shared cache. Never claim exactly-once upstream fetching under failures or across process restarts; claim one upstream fetch for a deterministic simultaneously pending compatible burst when healthy and inside configured bounds.

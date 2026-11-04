@@ -68,6 +68,24 @@ impl Fixture {
                                     }
                                     let mut response = Response::new(Full::new(Bytes::from(format!("version-{number}"))));
                                     response.headers_mut().insert("cache-control", "public, max-age=60".parse().unwrap());
+                                    if request.uri().path().starts_with("/public/modified") {
+                                        response.headers_mut().insert("last-modified", "Wed, 01 Jan 2020 00:00:00 GMT".parse().unwrap());
+                                        if request.uri().path() == "/public/modified-both" {
+                                            response.headers_mut().insert("etag", "\"v1\"".parse().unwrap());
+                                        }
+                                        if request.headers().contains_key("if-modified-since") || request.headers().contains_key("if-none-match") {
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                            if request.uri().path() == "/public/modified-changed" {
+                                                response.headers_mut().insert("last-modified", "Thu, 02 Jan 2020 00:00:00 GMT".parse().unwrap());
+                                            } else {
+                                                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                                                *response.body_mut() = Full::new(Bytes::new());
+                                                if request.uri().path() == "/public/modified-private" {
+                                                    response.headers_mut().insert("cache-control", "private".parse().unwrap());
+                                                }
+                                            }
+                                        }
+                                    }
                                     if request.uri().path().starts_with("/public/etag") {
                                         response.headers_mut().insert("etag", "\"v1\"".parse().unwrap());
                                         if request.headers().contains_key("if-none-match") {
@@ -514,6 +532,70 @@ async fn changed_etag_replaces_body_and_unsafe_304_never_serves_stale() {
                     .lock()
                     .unwrap()
                     .contains_key("if-none-match")
+            );
+        }
+        fixture.proxy.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn last_modified_revalidation_coalesces_and_etag_takes_precedence() {
+    for path in ["/public/modified", "/public/modified-both"] {
+        let mut fixture = Fixture::start(&["--max-ttl-secs", "1"]).await;
+        assert_eq!(fixture.get(path).await.body(), "version-1");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let mut callers = JoinSet::new();
+        for _ in 0..20 {
+            let address = fixture.proxy.address;
+            callers.spawn(async move { request(address, "GET", path, &[]).await });
+        }
+        while let Some(result) = callers.join_next().await {
+            let response = result.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.body(), "version-1");
+        }
+        assert_eq!(fixture.count(), 2);
+        let headers = fixture.last_headers.lock().unwrap().clone();
+        if path.ends_with("both") {
+            assert_eq!(headers["if-none-match"], "\"v1\"");
+            assert!(!headers.contains_key("if-modified-since"));
+        } else {
+            assert_eq!(
+                headers["if-modified-since"],
+                "Wed, 01 Jan 2020 00:00:00 GMT"
+            );
+            assert!(!headers.contains_key("if-none-match"));
+        }
+        assert_eq!(fixture.get(path).await.body(), "version-1");
+        assert_eq!(fixture.count(), 2);
+        fixture.proxy.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn last_modified_changed_body_and_private_validation_follow_existing_policy() {
+    for (path, expected) in [
+        ("/public/modified-changed", StatusCode::OK),
+        ("/public/modified-private", StatusCode::BAD_GATEWAY),
+    ] {
+        let mut fixture = Fixture::start(&["--max-ttl-secs", "1"]).await;
+        assert_eq!(fixture.get(path).await.body(), "version-1");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let response = fixture.get(path).await;
+        assert_eq!(response.status(), expected);
+        assert_ne!(response.body(), "version-1");
+        let again = fixture.get(path).await;
+        if expected == StatusCode::OK {
+            assert_eq!(again.body(), "version-2");
+            assert_eq!(fixture.count(), 2);
+        } else {
+            assert_eq!(again.body(), "version-3");
+            assert!(
+                !fixture
+                    .last_headers
+                    .lock()
+                    .unwrap()
+                    .contains_key("if-modified-since")
             );
         }
         fixture.proxy.shutdown().await;

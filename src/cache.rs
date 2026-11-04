@@ -77,6 +77,26 @@ impl Snapshot {
         .then_some(value)
     }
 
+    fn last_modified(&self) -> Option<&HeaderValue> {
+        let mut values = self.headers.get_all("last-modified").iter();
+        let value = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        let modified = httpdate::parse_http_date(value.to_str().ok()?).ok()?;
+        let date = httpdate::parse_http_date(self.headers.get(DATE)?.to_str().ok()?).ok()?;
+        (modified <= date).then_some(value)
+    }
+
+    pub(crate) fn validator(&self) -> Option<(&'static str, &HeaderValue)> {
+        self.etag()
+            .map(|value| ("if-none-match", value))
+            .or_else(|| {
+                self.last_modified()
+                    .map(|value| ("if-modified-since", value))
+            })
+    }
+
     pub(crate) fn revalidated(
         &self,
         headers: &HeaderMap,
@@ -110,13 +130,21 @@ impl Snapshot {
             max_ttl,
         )?;
         let mut updated = Self::new(merged, self.body.clone(), freshness, response_time);
-        let old = self.etag()?.as_bytes();
-        let new = updated.etag()?.as_bytes();
-        if old.strip_prefix(b"W/").unwrap_or(old) != new.strip_prefix(b"W/").unwrap_or(new) {
-            return None;
+        if let Some(old) = self.etag() {
+            let old = old.as_bytes();
+            let new = updated.etag()?.as_bytes();
+            if old.strip_prefix(b"W/").unwrap_or(old) != new.strip_prefix(b"W/").unwrap_or(new) {
+                return None;
+            }
+        } else {
+            let old = httpdate::parse_http_date(self.last_modified()?.to_str().ok()?).ok()?;
+            let new = httpdate::parse_http_date(updated.last_modified()?.to_str().ok()?).ok()?;
+            if old != new || headers.contains_key(ETAG) {
+                return None;
+            }
         }
         crate::headers::sanitize(&mut updated.headers).ok()?;
-        if !updated.headers.contains_key("cache-control") || updated.etag().is_none() {
+        if !updated.headers.contains_key("cache-control") || updated.validator().is_none() {
             return None;
         }
         Some(updated)
@@ -219,7 +247,7 @@ impl Cache {
             return None;
         };
         if entry.snapshot.freshness.expires_at() <= now {
-            if entry.snapshot.etag().is_none() {
+            if entry.snapshot.validator().is_none() {
                 state.remove(key);
             }
             state.stats.misses += 1;
@@ -296,7 +324,7 @@ impl Fill {
             return None;
         }
         let entry = state.entries.get(&self.key)?;
-        if entry.snapshot.is_fresh(Instant::now()) || entry.snapshot.etag().is_none() {
+        if entry.snapshot.is_fresh(Instant::now()) || entry.snapshot.validator().is_none() {
             return None;
         }
         let snapshot = entry.snapshot.clone();
@@ -508,6 +536,101 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn last_modified_requires_one_valid_nonfuture_date_and_prefers_etag() {
+        let now = Instant::now();
+        let mut value = snapshot("data", now);
+        let stored = Arc::get_mut(&mut value).unwrap();
+        stored
+            .headers
+            .insert(DATE, "Wed, 01 Jan 2020 00:00:00 GMT".parse().unwrap());
+        for (date, valid) in [
+            ("Tue, 31 Dec 2019 00:00:00 GMT", true),
+            ("Wed, 01 Jan 2020 00:00:00 GMT", true),
+            ("Thu, 02 Jan 2020 00:00:00 GMT", false),
+            ("invalid", false),
+        ] {
+            stored
+                .headers
+                .insert("last-modified", date.parse().unwrap());
+            assert_eq!(stored.validator().is_some(), valid);
+        }
+        stored.headers.insert(
+            "last-modified",
+            "Tue, 31 Dec 2019 00:00:00 GMT".parse().unwrap(),
+        );
+        stored.headers.append(
+            "last-modified",
+            "Tue, 31 Dec 2019 00:00:00 GMT".parse().unwrap(),
+        );
+        assert!(stored.validator().is_none());
+        stored.headers.insert(
+            "last-modified",
+            "Tue, 31 Dec 2019 00:00:00 GMT".parse().unwrap(),
+        );
+        stored.headers.insert(ETAG, "invalid".parse().unwrap());
+        assert_eq!(stored.validator().unwrap().0, "if-modified-since");
+        stored.headers.insert(ETAG, "\"v1\"".parse().unwrap());
+        assert_eq!(stored.validator().unwrap().0, "if-none-match");
+    }
+
+    #[test]
+    fn date_validation_rejects_conflicts_and_preserves_fill_fencing() {
+        let now = Instant::now() - Duration::from_secs(20);
+        let wall = httpdate::parse_http_date("Wed, 01 Jan 2020 00:00:00 GMT").unwrap();
+        let mut value = snapshot("data", now);
+        let stored = Arc::get_mut(&mut value).unwrap();
+        stored
+            .headers
+            .insert(DATE, httpdate::fmt_http_date(wall).parse().unwrap());
+        stored.headers.insert(
+            "last-modified",
+            "Tue, 31 Dec 2019 00:00:00 GMT".parse().unwrap(),
+        );
+        assert!(
+            stored
+                .revalidated(&HeaderMap::new(), now, now, wall, Duration::from_secs(10))
+                .is_some()
+        );
+        for (name, raw) in [
+            ("last-modified", "invalid"),
+            ("last-modified", "Mon, 30 Dec 2019 00:00:00 GMT"),
+            ("etag", "\"new\""),
+            ("set-cookie", "secret=1"),
+            ("connection", "last-modified"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                raw.parse().unwrap(),
+            );
+            assert!(
+                stored
+                    .revalidated(&headers, now, now, wall, Duration::from_secs(10))
+                    .is_none(),
+                "{name}"
+            );
+        }
+        let cache = Cache::new(4096, 1, 1024);
+        assert!(cache.begin_fill(key("date")).insert(value.clone(), now));
+        assert!(cache.get(&key("date"), Instant::now()).is_none());
+        assert_eq!(cache.stats().entries, 1);
+        let fill = cache.begin_fill(key("date"));
+        assert!(fill.take_stale().is_some());
+        assert_eq!(cache.stats().bytes, 0);
+        drop(cache.begin_mutation(key("date")));
+        let refreshed = value
+            .revalidated(
+                &HeaderMap::new(),
+                Instant::now(),
+                Instant::now(),
+                wall,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(!fill.insert(Arc::new(refreshed), Instant::now()));
     }
 
     #[test]
