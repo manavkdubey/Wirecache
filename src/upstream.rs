@@ -55,13 +55,19 @@ impl Upstream {
 
     pub(crate) async fn fetch(
         &self,
-        request: Request<ProxyBody>,
+        mut request: Request<ProxyBody>,
         fill: Option<Fill>,
         deadline: Instant,
     ) -> FetchResult {
         let Ok(permit) = self.slots.clone().try_acquire_owned() else {
             return FetchResult::Failed(FetchError::Overloaded);
         };
+        let stale = fill.as_ref().and_then(Fill::take_stale);
+        if let Some(snapshot) = &stale {
+            request
+                .headers_mut()
+                .insert("if-none-match", snapshot.etag().unwrap().clone());
+        }
         let requested_at = Instant::now();
         let mut lease = UpstreamLease::new(permit, self.telemetry.start(Scope::Upstream), deadline);
         let response = match timeout_at(deadline, self.client.request(request)).await {
@@ -76,6 +82,31 @@ impl Upstream {
                 return FetchResult::Failed(FetchError::Timeout);
             }
         };
+        if response.status() == StatusCode::NOT_MODIFIED
+            && let Some(stale) = stale
+        {
+            let updated = stale.revalidated(
+                response.headers(),
+                requested_at,
+                Instant::now(),
+                SystemTime::now(),
+                Duration::from_secs(self.config.max_ttl_secs),
+            );
+            return match updated {
+                Some(snapshot) => {
+                    let snapshot = Arc::new(snapshot);
+                    if let Some(fill) = fill {
+                        fill.insert(snapshot.clone(), Instant::now());
+                    }
+                    lease.finish(End::Success);
+                    FetchResult::Shared(snapshot)
+                }
+                None => {
+                    lease.finish(End::Transport);
+                    FetchResult::Failed(FetchError::Transport)
+                }
+            };
+        }
         self.forward_response(response, fill, requested_at, deadline, lease)
             .await
     }

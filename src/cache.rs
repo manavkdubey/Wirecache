@@ -7,7 +7,7 @@ use std::{
 use bytes::Bytes;
 use hyper::{
     Response,
-    header::{AGE, DATE, HeaderMap},
+    header::{AGE, DATE, ETAG, HeaderMap, HeaderValue},
 };
 use tokio::time::Instant;
 
@@ -58,6 +58,68 @@ impl Snapshot {
                 .unwrap(),
         );
         response
+    }
+
+    pub(crate) fn etag(&self) -> Option<&HeaderValue> {
+        let mut values = self.headers.get_all(ETAG).iter();
+        let value = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        let raw = value.as_bytes();
+        let raw = raw.strip_prefix(b"W/").unwrap_or(raw);
+        (raw.len() >= 2
+            && raw.first() == Some(&b'"')
+            && raw.last() == Some(&b'"')
+            && raw[1..raw.len() - 1]
+                .iter()
+                .all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte) || *byte >= 0x80))
+        .then_some(value)
+    }
+
+    pub(crate) fn revalidated(
+        &self,
+        headers: &HeaderMap,
+        requested_at: Instant,
+        received_at: Instant,
+        response_time: SystemTime,
+        max_ttl: std::time::Duration,
+    ) -> Option<Self> {
+        let mut merged = self.headers.clone();
+        // Validation age starts at this origin exchange, not the stored response.
+        merged.remove(AGE);
+        merged.remove(DATE);
+        if let Some(length) = headers.get("content-length")
+            && (headers.get_all("content-length").iter().count() != 1
+                || length.to_str().ok()?.parse::<usize>().ok()? != self.body.len())
+        {
+            return None;
+        }
+        for name in headers.keys() {
+            merged.remove(name);
+            for value in headers.get_all(name) {
+                merged.append(name.clone(), value.clone());
+            }
+        }
+        let freshness = crate::policy::response_freshness(
+            hyper::StatusCode::OK,
+            &merged,
+            requested_at,
+            received_at,
+            response_time,
+            max_ttl,
+        )?;
+        let mut updated = Self::new(merged, self.body.clone(), freshness, response_time);
+        let old = self.etag()?.as_bytes();
+        let new = updated.etag()?.as_bytes();
+        if old.strip_prefix(b"W/").unwrap_or(old) != new.strip_prefix(b"W/").unwrap_or(new) {
+            return None;
+        }
+        crate::headers::sanitize(&mut updated.headers).ok()?;
+        if !updated.headers.contains_key("cache-control") || updated.etag().is_none() {
+            return None;
+        }
+        Some(updated)
     }
 
     fn charge(&self, key: &CacheKey) -> Option<usize> {
@@ -157,7 +219,9 @@ impl Cache {
             return None;
         };
         if entry.snapshot.freshness.expires_at() <= now {
-            state.remove(key);
+            if entry.snapshot.etag().is_none() {
+                state.remove(key);
+            }
             state.stats.misses += 1;
             return None;
         }
@@ -223,6 +287,21 @@ impl Fill {
 
     pub(crate) fn is_current(&self) -> bool {
         self.cache.version_matches(&self.key, &self.version)
+    }
+
+    pub(crate) fn take_stale(&self) -> Option<Arc<Snapshot>> {
+        let mut state = self.cache.state.lock().unwrap();
+        let target = state.targets.get(&self.key)?;
+        if target.mutations > 0 || !Arc::ptr_eq(&self.version, &target.version) {
+            return None;
+        }
+        let entry = state.entries.get(&self.key)?;
+        if entry.snapshot.is_fresh(Instant::now()) || entry.snapshot.etag().is_none() {
+            return None;
+        }
+        let snapshot = entry.snapshot.clone();
+        state.remove(&self.key);
+        Some(snapshot)
     }
 
     pub(crate) fn insert(&self, snapshot: Arc<Snapshot>, now: Instant) -> bool {
@@ -337,6 +416,120 @@ mod tests {
             freshness,
             SystemTime::UNIX_EPOCH,
         ))
+    }
+
+    #[test]
+    fn validators_are_single_entity_tags_and_validation_rechecks_privacy() {
+        let now = Instant::now();
+        for (tag, valid) in [
+            ("\"v1\"", true),
+            ("W/\"v1\"", true),
+            ("*", false),
+            ("v1", false),
+            ("\"a\", \"b\"", false),
+            ("\"has space\"", false),
+        ] {
+            let mut value = snapshot("data", now);
+            Arc::get_mut(&mut value)
+                .unwrap()
+                .headers
+                .insert(ETAG, tag.parse().unwrap());
+            assert_eq!(value.etag().is_some(), valid, "{tag}");
+        }
+        let mut value = snapshot("data", now);
+        Arc::get_mut(&mut value)
+            .unwrap()
+            .headers
+            .insert(ETAG, "\"v1\"".parse().unwrap());
+        for (name, header) in [
+            ("etag", "\"other\""),
+            ("set-cookie", "secret=1"),
+            ("vary", "Accept"),
+            ("cache-control", "private"),
+            ("content-length", "99"),
+            ("age", "999"),
+            ("date", "bad"),
+            ("connection", "etag"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                header.parse().unwrap(),
+            );
+            assert!(
+                value
+                    .revalidated(
+                        &headers,
+                        now,
+                        now,
+                        SystemTime::UNIX_EPOCH,
+                        Duration::from_secs(10)
+                    )
+                    .is_none(),
+                "{name}"
+            );
+        }
+        let refreshed = value
+            .revalidated(
+                &HeaderMap::new(),
+                now,
+                now,
+                SystemTime::UNIX_EPOCH,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(refreshed.body, "data");
+        assert_eq!(refreshed.freshness.age(now), Duration::ZERO);
+        let mut weak = HeaderMap::new();
+        weak.insert(ETAG, "W/\"v1\"".parse().unwrap());
+        weak.insert("cache-control", "public, max-age=30".parse().unwrap());
+        let refreshed = value
+            .revalidated(
+                &weak,
+                now,
+                now,
+                SystemTime::UNIX_EPOCH,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(
+            refreshed.freshness.expires_at(),
+            now + Duration::from_secs(30)
+        );
+        weak.append(ETAG, "W/\"v1\"".parse().unwrap());
+        assert!(
+            value
+                .revalidated(
+                    &weak,
+                    now,
+                    now,
+                    SystemTime::UNIX_EPOCH,
+                    Duration::from_secs(30)
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_validators_remain_bounded_and_mutations_prevent_reuse() {
+        let now = Instant::now() - Duration::from_secs(20);
+        let cache = Cache::new(4096, 1, 1024);
+        let mut value = snapshot("data", now);
+        Arc::get_mut(&mut value)
+            .unwrap()
+            .headers
+            .insert(ETAG, "\"v1\"".parse().unwrap());
+        assert!(cache.begin_fill(key("a")).insert(value.clone(), now));
+        assert!(cache.get(&key("a"), Instant::now()).is_none());
+        assert_eq!(cache.stats().entries, 1);
+        let fill = cache.begin_fill(key("a"));
+        assert!(Arc::ptr_eq(&fill.take_stale().unwrap(), &value));
+        assert_eq!(cache.stats().bytes, 0);
+        assert!(fill.take_stale().is_none());
+        assert!(fill.insert(value, now));
+        let mutation = cache.begin_mutation(key("a"));
+        assert!(fill.take_stale().is_none());
+        drop(mutation);
     }
 
     #[test]

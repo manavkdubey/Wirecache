@@ -42,7 +42,8 @@ When a popular resource expires, numerous clients can simultaneously miss cache 
 - Bounded admission: max concurrent upstream flights, max waiters per key, max distinct flights, cache byte cap, entry cap, timeouts; overload returns 503 with Retry-After or defined fail-open behavior.
 
 ### P1 — after MVP
-- Conditional requests with validators (ETag/If-None-Match, 304), additional `Vary` variants (e.g. Accept-Encoding) with canonicalized variant matching, broader invalidation beyond the P0 same-target policy, streaming follower responses if feasible, graceful drain, CLI config validation.
+ETag revalidation is implemented; see [ADR-007](docs/adr/ADR-007-etag-revalidation.md). The remaining items below are future work.
+- Last-Modified validation and downstream conditional cache handling, additional `Vary` variants (e.g. Accept-Encoding) with canonicalized variant matching, broader invalidation beyond the P0 same-target policy, streaming follower responses if feasible, graceful drain, CLI config validation.
 
 ### P2 — intentionally not a requirement
 - HTTPS termination, HTTP/2/3, CONNECT/WebSockets, arbitrary origin selection, multi-node coordination, disk persistence, CDN functionality, full RFC 9111 conformance, public internet exposure, distributed cache consistency.

@@ -68,6 +68,23 @@ impl Fixture {
                                     }
                                     let mut response = Response::new(Full::new(Bytes::from(format!("version-{number}"))));
                                     response.headers_mut().insert("cache-control", "public, max-age=60".parse().unwrap());
+                                    if request.uri().path().starts_with("/public/etag") {
+                                        response.headers_mut().insert("etag", "\"v1\"".parse().unwrap());
+                                        if request.headers().contains_key("if-none-match") {
+                                            assert_eq!(request.headers()["if-none-match"], "\"v1\"");
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                            if request.uri().path() == "/public/etag-changed" {
+                                                response.headers_mut().insert("etag", "\"v2\"".parse().unwrap());
+                                            } else {
+                                                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                                                *response.body_mut() = Full::new(Bytes::new());
+                                                response.headers_mut().insert("x-validated", "yes".parse().unwrap());
+                                                if request.uri().path() == "/public/etag-private" {
+                                                    response.headers_mut().insert("set-cookie", "secret=1".parse().unwrap());
+                                                }
+                                            }
+                                        }
+                                    }
                                     match request.uri().path() {
                                         "/public/private" => { response.headers_mut().insert("cache-control", "private, max-age=60".parse().unwrap()); }
                                         "/public/no-store" => { response.headers_mut().insert("cache-control", "public, max-age=60, no-store".parse().unwrap()); }
@@ -448,4 +465,57 @@ async fn stalled_candidate_returns_504_without_storing_a_partial_body() {
     release.send(()).unwrap();
     origin.await.unwrap();
     proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn expired_etag_coalesces_validation_and_reuses_body_with_updated_headers() {
+    let mut fixture = Fixture::start(&["--max-ttl-secs", "1"]).await;
+    let first = fixture.get("/public/etag").await;
+    assert_eq!(first.body(), "version-1");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let mut callers = JoinSet::new();
+    for _ in 0..20 {
+        let address = fixture.proxy.address;
+        callers.spawn(async move { request(address, "GET", "/public/etag", &[]).await });
+    }
+    while let Some(result) = callers.join_next().await {
+        let response = result.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body(), "version-1");
+        assert_eq!(response.headers()["x-validated"], "yes");
+    }
+    assert_eq!(fixture.count(), 2);
+    assert_eq!(fixture.get("/public/etag").await.body(), "version-1");
+    assert_eq!(fixture.count(), 2);
+    fixture.proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn changed_etag_replaces_body_and_unsafe_304_never_serves_stale() {
+    for (path, expected) in [
+        ("/public/etag-changed", StatusCode::OK),
+        ("/public/etag-private", StatusCode::BAD_GATEWAY),
+    ] {
+        let mut fixture = Fixture::start(&["--max-ttl-secs", "1"]).await;
+        assert_eq!(fixture.get(path).await.body(), "version-1");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let response = fixture.get(path).await;
+        assert_eq!(response.status(), expected);
+        assert_ne!(response.body(), "version-1");
+        let again = fixture.get(path).await;
+        if expected == StatusCode::OK {
+            assert_eq!(again.body(), "version-2");
+            assert_eq!(fixture.count(), 2);
+        } else {
+            assert_eq!(again.body(), "version-3");
+            assert!(
+                !fixture
+                    .last_headers
+                    .lock()
+                    .unwrap()
+                    .contains_key("if-none-match")
+            );
+        }
+        fixture.proxy.shutdown().await;
+    }
 }

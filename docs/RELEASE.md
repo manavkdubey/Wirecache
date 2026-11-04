@@ -1,6 +1,6 @@
 # P0 release review
 
-P0 implementation is complete. P1/P2 features remain intentionally outside this release.
+P0 implementation is complete. ETag revalidation is now implemented as a P1 extension; other P1/P2 features remain future work.
 
 | Gate | Evidence |
 |---|---|
@@ -11,12 +11,14 @@ P0 implementation is complete. P1/P2 features remain intentionally outside this 
 | Cancellation and failures | Leader/follower/last-caller disconnect, repeated failure, timeout, worker panic/abort, and shutdown tests. |
 | Resource bounds | 1,000-key admission pressure; waiter/connection/origin limits; oversized/partial/chunked bodies; stalled readers/uploads; buffer accounting and cleanup. |
 | Observability | Fixed labels, cumulative histograms, body/resource guards, scoped error/cancellation accounting, and documented measurement limits. |
-| Local validation | 71 Rust tests, seven Python tests, formatting, Clippy with warnings denied, release builds, and the live two-mode demo passed. |
+| Local validation | 75 Rust tests, seven Python tests, formatting, Clippy with warnings denied, release builds, and the live two-mode demo passed. |
 | Measurement | Three repetitions across four modes; 303,900 timed samples with zero errors; raw data, source checksums, commands, CPU and RSS retained. |
 | Automation | Pinned checkout, stable Rust checks, analysis tests, release builds, and demo smoke job; [hosted CI passed](https://github.com/manavkdubey/Wirecache/actions/runs/41229924559). |
 
 No unsafe Rust or new runtime dependencies were needed for the benchmark/demo milestone. Static analysis and regression tests are evidence for this scoped project, not proof of complete HTTP or production security compliance.
 
-Remaining limits: no TLS, HTTP/2/3, tunnels, disk/distributed cache, variant matching, validator revalidation, full invalidation semantics, or visibility into external origin updates. Cache byte gauges are not an RSS ceiling. Reference measurements cover a small local working set; broader payload/concurrency/memory sweeps are future measurement work.
+Remaining limits: no TLS, HTTP/2/3, tunnels, disk/distributed cache, variant matching, Last-Modified revalidation, downstream conditional cache handling, full invalidation semantics, or visibility into external origin updates. Cache byte gauges are not an RSS ceiling. Reference measurements cover a small local working set; broader payload/concurrency/memory sweeps are future measurement work.
 
 The interview-defense exercise in the original mentoring prompt requires the author's own attempted answers before model answers are produced. It is a learning follow-up, not an implemented runtime feature or a P0 release gate.
+
+ETag extension: expired validator-bearing entries remain within cache bounds until selected for validation or evicted. One coalesced conditional origin request refreshes a safe `304` or replaces the body on `200`. Invalid or unsafe `304` metadata yields `502`; failures never authorize serving stale content. The original benchmark evidence predates this extension.

@@ -83,11 +83,11 @@ cargo test --offline --locked
 python3 -m unittest discover -s scripts/tests
 ```
 
-The suite contains **71 Rust tests and 7 Python analysis/export tests**, including controlled multithreaded coalescing, cancellation/panic cleanup, privacy, framing, mutation races, stalled readers/uploads, admission pressure, and buffer accounting. CI runs checks, release builds, and the stampede demo.
+The suite contains **75 Rust tests and 7 Python analysis/export tests**, including controlled multithreaded coalescing, cancellation/panic cleanup, privacy, framing, mutation races, stalled readers/uploads, admission pressure, and buffer accounting. CI runs checks, release builds, and the stampede demo.
 
 ## Scope and design record
 
-P0 is implemented. P1 features such as validator revalidation and selected Vary variants are future work. TLS, HTTP/2/3, tunnels, distributed coordination, persistence, arbitrary origins, and production CDN behavior are outside scope. Updates outside this proxy and related-URL invalidation are not observed. Already-started body failures terminate the connection; they cannot replace the status. Healthy keep-alive connections have no fixed lifetime.
+P0 and ETag revalidation are implemented. Expired ETag-bearing responses can be validated with one coalesced `If-None-Match` request; a safe `304` refreshes the stored body. Other P1 features, including selected Vary variants and Last-Modified revalidation, remain future work. See [the revalidation policy](docs/adr/ADR-007-etag-revalidation.md). TLS, HTTP/2/3, tunnels, distributed coordination, persistence, arbitrary origins, and production CDN behavior are outside scope. Updates outside this proxy and related-URL invalidation are not observed. Already-started body failures terminate the connection; they cannot replace the status. Healthy keep-alive connections have no fixed lifetime.
 
 Read the [threat model](docs/THREAT_MODEL.md), [resource/memory model](docs/RESOURCE_LIMITS.md), [metric semantics](docs/METRICS.md), and [release review](docs/RELEASE.md). Decisions: [fixed origin](docs/adr/ADR-001-fixed-origin.md), [cache policy](docs/adr/ADR-002-cache-policy.md), [buffering](docs/adr/ADR-003-body-buffering.md), [flight ownership](docs/adr/ADR-004-flight-lifecycle.md), [publication ordering](docs/adr/ADR-005-flight-publication.md), and [LRU/invalidation](docs/adr/ADR-006-cache-storage.md).
 
